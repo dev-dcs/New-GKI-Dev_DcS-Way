@@ -1,0 +1,30 @@
+GPL-2.0-only
+
+Copyright (C) 2026 @Dev_DcS
+
+This project is licensed under the terms of the GNU General Public License
+version 2 (GPL-2.0-only), the same license as the Linux kernel. The kernel
+module in mosey/wonder_mosey_wild.c links against the kernel and therefore
+must be, and is, released under GPL-2.0 (see its SPDX-License-Identifier).
+
+The full text of the GNU General Public License version 2 is the canonical
+document distributed with the Linux kernel as its COPYING file:
+
+    https://www.kernel.org/doc/html/latest/process/license-rules.html
+    https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/COPYING
+
+A copy also lives at:
+
+    https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+SPDX-License-Identifier: GPL-2.0-only
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+The build workflows pull in third-party sources (SUSFS, WildKernels patches,
+FinaSU, KernelSU and variants, Baseband-guard, mosey-extended, DroidSpaces,
+NoMount, AnyKernel3, the AOSP common kernel). Each remains under its own
+license held by its respective authors; see the Thanks section of README.md
+for where each comes from.

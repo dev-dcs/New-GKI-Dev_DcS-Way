@@ -1,0 +1,9 @@
+# build junk / local scratch
+*.ko
+*.o
+*.zip
+out/
+dist/
+kernel_workspace/
+*.log
+.DS_Store

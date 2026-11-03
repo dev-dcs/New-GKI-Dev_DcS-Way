@@ -1,0 +1,17 @@
+config NV_WRITE_GUARD
+	bool "NV data write guard (protect modem RF-cal / IMEI NV from overwrite)"
+	depends on SECURITY
+	default n
+	help
+	  A tiny LSM that denies write-open, unlink and rename of the modem's
+	  irreplaceable NV blob (default basename: nv_protected.bin on the
+	  efs / vendor partition), so a bad or torn write can't corrupt the RF
+	  calibration / IMEI data and leave the radio dead.
+
+	  The working-state blob (nv_normal.bin) is deliberately left writable
+	  so the modem can still regenerate it after a wipe. Default-off; even
+	  when built in it only enforces once 'nv_guard' is in the active LSM
+	  list (CONFIG_LSM / lsm= bootarg). Runtime knobs are under
+	  /sys/module/nv_guard/parameters (enforce, unlocked, names).
+
+	  If unsure, say N.

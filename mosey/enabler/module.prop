@@ -1,0 +1,6 @@
+id=mosey-enabler
+name=Mosey: AirDrop (Pixel 10 / FinaSU build)
+version=1.32-dcs
+versionCode=33
+author=@Dev_DcS
+description=Mosey / Quick Share AirDrop enabler with the wonder phy baked in. Pixel 10 (blazer) uses its native BCM4398 wondertap; on devices without it the bundled wonder_mosey_wild.ko fills in. Based on feelliao's Mosey enabler - see README thanks.

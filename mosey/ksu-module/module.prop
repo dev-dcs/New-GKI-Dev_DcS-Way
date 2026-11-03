@@ -1,0 +1,6 @@
+id=mosey_wonder
+name=Mosey wonder phy
+version=unknown-build-it-yourself
+versionCode=1
+author=@Dev_DcS
+description=Loads wonder_mosey_wild.ko so mosey-extended gets its 'wonder' phy. Only loads on the kernel it was built with: unknown-build-it-yourself
