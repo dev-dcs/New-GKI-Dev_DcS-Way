@@ -98,7 +98,7 @@ subcmds 1–5) and hands back a locally-administered MAC. There's no real radio
 underneath — it's there so `mosey_server`'s bring-up finishes. Which brings me
 to the Pixel 10 note.
 
-### Pixel 10 (blazer)
+### Pixel 10's
 
 Pixel 10 runs the **6.6** kernel, so the FinaSU workflow defaults to
 `android15-6.6` at the latest LTS. That's the number that matters here — double
