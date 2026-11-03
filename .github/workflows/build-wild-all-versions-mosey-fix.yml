@@ -1,4 +1,4 @@
-name: Build Wild Kernels (All Versions 5.10 - 6.12) + Mosey Extended
+name: Build Wild Kernels (6.1 / 6.6 / 6.12) + Mosey Extended
 
 permissions:
   contents: write
@@ -9,21 +9,16 @@ on:
     inputs:
       # --- Core Kernel & Matrix Selection (All WildKernels Families) ---
       kernel_build_version:
-        description: "Kernel Version Family (select 'all' to build all 7 GKI families in parallel)"
+        description: "Kernel Version Family (select 'all' to build 6.1 / 6.6 / 6.12 in parallel)"
         type: choice
         options:
           - android15-6.6
           - android14-6.1
-          - android14-5.15
-          - android13-5.15
-          - android13-5.10
-          - android12-5.10
           - android16-6.12
-          - android17-6.18
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "Specific LTS Subversion (e.g. 6.6.144, 6.1.145, 5.15.180, 5.10.236, 6.12.92) or leave blank for latest LTS"
+        description: "Specific LTS Subversion (e.g. 6.6.144, 6.1.145, 6.12.92) or leave blank for latest LTS"
         type: string
         default: "6.6.144"
       page_size:
@@ -163,38 +158,6 @@ jobs:
 
           all_families = [
               {
-                  "kernel_version": "android12-5.10",
-                  "kver": "5.10",
-                  "manifest_branch": "common-android12-5.10-lts",
-                  "susfs_branch": "gki-android12-5.10",
-                  "cache_type": "ccache",
-                  "build_tool": "build_sh",
-              },
-              {
-                  "kernel_version": "android13-5.10",
-                  "kver": "5.10",
-                  "manifest_branch": "common-android13-5.10-lts",
-                  "susfs_branch": "gki-android13-5.10",
-                  "cache_type": "ccache",
-                  "build_tool": "build_sh",
-              },
-              {
-                  "kernel_version": "android13-5.15",
-                  "kver": "5.15",
-                  "manifest_branch": "common-android13-5.15-lts",
-                  "susfs_branch": "gki-android13-5.15",
-                  "cache_type": "ccache",
-                  "build_tool": "auto",
-              },
-              {
-                  "kernel_version": "android14-5.15",
-                  "kver": "5.15",
-                  "manifest_branch": "common-android14-5.15-lts",
-                  "susfs_branch": "gki-android14-5.15",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
                   "kernel_version": "android14-6.1",
                   "kver": "6.1",
                   "manifest_branch": "common-android14-6.1-lts",
@@ -215,14 +178,6 @@ jobs:
                   "kver": "6.12",
                   "manifest_branch": "common-android16-6.12-lts",
                   "susfs_branch": "gki-android16-6.12",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android17-6.18",
-                  "kver": "6.18",
-                  "manifest_branch": "common-android17-6.18-lts",
-                  "susfs_branch": "gki-android17-6.18",
                   "cache_type": "bazel",
                   "build_tool": "bazel",
               },
@@ -594,20 +549,34 @@ jobs:
           # heal itself. Ships as a tiny LSM; only bites once it is in CONFIG_LSM.
           if [ "${{ inputs.nv_write_guard }}" = "true" ]; then
             echo "[+] Integrating NV write guard (nv_guard LSM)..."
-            NVP="$(ls "$GITHUB_WORKSPACE"/kernel-patches/nv_guard/*.patch 2>/dev/null | head -1)"
-            if [ ! -f security/nv_guard/nv_guard.c ] && [ -n "$NVP" ]; then
-              patch -p1 --forward --fuzz=3 < "$NVP" && echo "[+] nv_guard patch applied ($NVP)"
+            NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
+            # Copy the sources in rather than applying a context patch: the
+            # patch was cut against 6.6, and security/Kconfig + security/Makefile
+            # differ across 5.10..6.18, so `patch --fuzz` lands at the wrong
+            # offset on other trees (it corrupted security/Kconfig on 5.10).
+            # The .c/.Kconfig/.Makefile themselves are version-independent.
+            if [ ! -f security/nv_guard/nv_guard.c ] && [ -f "$NVD/nv_guard.c" ]; then
+              mkdir -p security/nv_guard
+              cp "$NVD/nv_guard.c" "$NVD/Kconfig" "$NVD/Makefile" security/nv_guard/
+              echo "[+] nv_guard sources copied into security/nv_guard/"
             fi
             if [ -f security/nv_guard/nv_guard.c ]; then
+              # Wire Kconfig/Makefile by anchor, idempotently - no diff to fuzz.
+              # keys/Kconfig is the first `source` inside the security menu on
+              # every GKI version, so inserting after it is always in-menu.
+              grep -q 'security/nv_guard/Kconfig' security/Kconfig || \
+                sed -i 's#^source "security/keys/Kconfig"#&\nsource "security/nv_guard/Kconfig"#' security/Kconfig
+              grep -q 'nv_guard/' security/Makefile || \
+                printf 'obj-$(CONFIG_NV_WRITE_GUARD) += nv_guard/\n' >> security/Makefile
               DEF="arch/arm64/configs/gki_defconfig"
               grep -q '^CONFIG_NV_WRITE_GUARD=y' "$DEF" || echo 'CONFIG_NV_WRITE_GUARD=y' >> "$DEF"
               sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /nv_guard/! s/selinux/selinux,nv_guard/ } }' security/Kconfig
               if grep -q '^CONFIG_LSM=' "$DEF" && ! grep -q '^CONFIG_LSM=.*nv_guard' "$DEF"; then
                 sed -i 's/^\(CONFIG_LSM="[^"]*\)selinux/\1selinux,nv_guard/' "$DEF"
               fi
-              echo "[+] nv_guard enabled and added to CONFIG_LSM"
+              echo "[+] nv_guard wired (sources + Kconfig/Makefile + CONFIG_LSM)"
             else
-              echo "::warning::nv_write_guard requested but security/nv_guard not present (ship kernel-patches/nv_guard/*.patch); skipping"
+              echo "::warning::nv_write_guard requested but kernel-patches/nv_guard sources not found; skipping"
             fi
           fi
 
@@ -1251,7 +1220,7 @@ jobs:
             else
               BAZEL_TARGET="//common:kernel_aarch64_dist"
             fi
-            tools/bazel run --config=fast "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+            tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
           else
             echo "[+] Building ${{ matrix.kernel_version }} with legacy build/build.sh + ccache..."
             export CCACHE_DIR="$HOME/.cache/ccache"

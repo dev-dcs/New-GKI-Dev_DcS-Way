@@ -10,10 +10,10 @@ There are two workflows:
 - **`build-finasu-mosey.yml`** — my daily driver. FinaSU, done the way FinaSU
   wants it (its own SUSFS, nothing stapled on), defaulted to the Pixel 10
   series (`android15-6.6`, latest LTS). If you're on FinaSU, use this.
-- **`build-wild-all-versions-mosey-fix.yml`** — the kitchen sink. Any GKI family
-  from 5.10 all the way up to 6.18, any root manager (KernelSU-Next, KernelSU,
-  BakaSU, ReSukiSU, KowSU, FinaSU, or No Root), one at a time or `all` in
-  one run.
+- **`build-wild-all-versions-mosey-fix.yml`** — the kitchen sink. Any of the
+  current GKI families — **6.1, 6.6, or 6.12** — any root manager (KernelSU-Next,
+  KernelSU, BakaSU, ReSukiSU, KowSU, FinaSU, or No Root), one at a time or `all`
+  in one run.
 
 Both spit out a kernel zip plus the Mosey module as build artifacts, and can cut
 a Release if you ask them to.
@@ -32,7 +32,7 @@ know you want otherwise, and wait. When it's done:
 
 The runner does the whole thing itself — syncs the GKI manifest, pulls the
 WildKernels patches, SUSFS and your root, patches and configures, compiles
-(Bazel on 5.15-and-up, the old `build.sh` on 5.10), and packages. Nothing runs
+(Bazel/Kleaf, which all three families use), and packages. Nothing runs
 on your machine.
 
 ### The options that aren't obvious
@@ -40,7 +40,7 @@ on your machine.
 Most toggles are self-explanatory. The handful that bite if you get them wrong:
 
 - **`kernel_build_version`** — the GKI family, or `all` to fan out across every
-  one of them at once (that's 8 families × 3 core roots = 24 jobs, so don't run
+  one of them at once (that's 3 families × 3 core roots = 9 jobs, so don't run
   it casually).
 - **`gki_lts_version`** — pin an exact LTS like `6.6.144`, or leave it blank and
   take the newest.
@@ -75,16 +75,14 @@ paper over, so I swapped it out for ReSukiSU, which builds clean the way it's
 wired here. Every root in the list above is compile-verified, and FinaSU has its
 own dedicated workflow on top.
 
-## About 6.18
+## Why not 5.x or 6.18
 
-6.18 (`android17-6.18`) is in the all-versions builder now, same as the rest.
-One catch worth knowing before you pick it: **SUSFS doesn't have a 6.18 branch
-yet**. Upstream stops at 6.12. So a 6.18 build comes out SUSFS-off — the build
-detects there's no SUSFS to apply and skips its configs instead of leaving you
-with a kernel that won't link. The practical fallout: roots that hard-depend on
-SUSFS (FinaSU, and KernelSU-Next's susfs branch) can't do 6.18 until upstream
-lands it; plain KernelSU, BakaSU, ReSukiSU and KowSU build fine. Once SUSFS
-tags a 6.18 branch this starts working on its own, no change needed.
+The build list is **6.1 / 6.6 / 6.12** on purpose. The old 5.10/5.15 families
+are dropped — they're legacy and I don't ship them. 6.18 is left out too: there
+isn't an upstream SUSFS branch for `android17-6.18` yet (SUSFS stops at 6.12),
+so a 6.18 build would come out SUSFS-off and the SUSFS-dependent roots couldn't
+run on it. Once SUSFS tags a 6.18 branch it can go back in; for now the three
+families above are the ones that actually build with the full feature set.
 
 ## Mosey (AirDrop in Quick Share)
 
@@ -205,11 +203,15 @@ stands between a bad actor (or a bad write) and the data you can't get back.
 
 Turn it on with the **`nv_write_guard`** toggle when you run a build (it's a
 boolean, defaults to **off**). With it off, the build is byte-for-byte what it
-always was — nothing is patched or configured. With it on, the workflow applies
-`kernel-patches/nv_guard/*.patch`, sets `CONFIG_NV_WRITE_GUARD=y`, and adds
-`nv_guard` to the active LSM list. If you only dropped the workflow file into a
-repo without `kernel-patches/`, the step warns and skips rather than failing the
-build.
+always was — nothing is copied or configured. With it on, the workflow copies
+`kernel-patches/nv_guard/` into `security/nv_guard/`, wires it into
+`security/Kconfig` and `security/Makefile` **by anchor** (not a version-specific
+diff, so it's safe on every GKI series we build — 6.1, 6.6 and 6.12), sets
+`CONFIG_NV_WRITE_GUARD=y`, and adds `nv_guard` to the active LSM list. If
+`kernel-patches/` isn't in the repo, the step warns and skips rather than
+failing the build. The bundled `.patch` is just a 6.6-cut copy for applying by
+hand — the workflow uses the sources directly, not the patch, which is why it
+no longer corrupts `security/Kconfig` on the older trees.
 
 Runtime knobs live under `/sys/module/nv_guard/parameters`:
 
@@ -255,7 +257,7 @@ FinaSU's Kbuild demands it, and lets FinaSU's own code do the rest.
 ```
 .github/workflows/
   build-finasu-mosey.yml                 FinaSU, Pixel 10 defaults
-  build-wild-all-versions-mosey-fix.yml  everything, 5.10 -> 6.18, all roots
+  build-wild-all-versions-mosey-fix.yml  6.1 / 6.6 / 6.12, all roots
 mosey/
   wonder_mosey_wild.c                    the cfg80211 wonder driver
   Kbuild
