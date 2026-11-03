@@ -1485,3 +1485,38 @@ jobs:
           path: |
             BuildInfo.txt
             mosey_out/*
+
+      - name: Fetch matching root manager APK (${{ matrix.root_variant }})
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p managers
+          # The in-kernel driver is already baked into the boot image; this
+          # just grabs the userspace manager app so it ships in one place.
+          case "${{ matrix.root_variant }}" in
+            FinaSU)        MGR_REPO="LyraVoid/FinaSU" ;;
+            BakaSU)        MGR_REPO="Baka-SU/BakaSU" ;;
+            KernelSU-Next) MGR_REPO="KernelSU-Next/KernelSU-Next" ;;
+            KernelSU)      MGR_REPO="tiann/KernelSU" ;;
+            ReSukiSU)      MGR_REPO="ReSukiSU/ReSukiSU" ;;
+            KowSU)         MGR_REPO="KOWX712/KernelSU" ;;
+            *)             MGR_REPO="" ;;
+          esac
+          if [ -z "$MGR_REPO" ]; then
+            echo "[i] ${{ matrix.root_variant }}: no manager app to fetch"
+            exit 0
+          fi
+          echo "[+] Fetching manager APK from $MGR_REPO (latest release)..."
+          if gh release download --repo "$MGR_REPO" --pattern '*.apk' --dir managers 2>/dev/null; then
+            echo "[+] manager APK(s): $(ls managers 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::no .apk in $MGR_REPO latest release (or repo unavailable); install the $MGR_REPO manager by hand"
+          fi
+
+      - name: Upload Root Manager APK
+        if: hashFiles('managers/*.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Manager"
+          path: managers/*.apk

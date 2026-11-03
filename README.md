@@ -29,6 +29,16 @@ know you want otherwise, and wait. When it's done:
   `wonder` kernel module already inside it. Flash it in KernelSU/Magisk if you
   want Mosey. (No `mosey/enabler/` in the repo? Then you get a stripped
   `*-Mosey-wonder.zip` that only carries the phy.)
+- `*-Manager` is the matching root **manager app** (the APK) for whatever root
+  you built, pulled from that project's latest release. The kernel already
+  carries the in-kernel driver; this is just the userspace app so it's in one
+  place. It's best-effort — if a project doesn't publish an APK, the step skips
+  it and you install the manager by hand. (No manager artifact for *No Root*.)
+
+> **Heads-up on GitHub artifacts:** downloading from the Actions tab always
+> wraps the file in an *outer* `.zip` (that's GitHub, not the build). Unzip that
+> once to get the real `...-AnyKernel3.zip` / enabler zip / `.apk`, then flash
+> the inner zip **as-is** — don't unzip the AnyKernel zip itself.
 
 The runner does the whole thing itself — syncs the GKI manifest, pulls the
 WildKernels patches, SUSFS and your root, patches and configures, compiles
