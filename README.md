@@ -34,6 +34,8 @@ know you want otherwise, and wait. When it's done:
   carries the in-kernel driver; this is just the userspace app so it's in one
   place. It's best-effort — if a project doesn't publish an APK, the step skips
   it and you install the manager by hand. (No manager artifact for *No Root*.)
+- `*-NoMount` (only when `ship_nomount` is on) is the NoMount module at its
+  current version, so it matches the kernel rather than mismatching the driver.
 
 > **Heads-up on GitHub artifacts:** downloading from the Actions tab always
 > wraps the file in an *outer* `.zip` (that's GitHub, not the build). Unzip that
@@ -62,6 +64,13 @@ Most toggles are self-explanatory. The handful that bite if you get them wrong:
 - **`security_patches`** — `monthly` (default), `latest-cve`, or `none`. What
   these mean, and why `latest-cve` comes with a warning, is its own section
   below. If you don't have a reason to touch it, leave it on `monthly`.
+- **`kernel_name`** — a custom name for `uname` (e.g. `Dev_DcS`). Blank keeps
+  the stock string; set it and it replaces the `-maybe-dirty` marker, so you get
+  `6.6.144-android15-8-Dev_DcS` instead of `…-maybe-dirty-4k`.
+- **`ship_nomount`** — off by default. On, the build also pulls the current
+  NoMount module (maxsteeel/nomount) and attaches it as a `*-NoMount` artifact,
+  so the module version lines up with the kernel instead of showing a driver
+  mismatch.
 
 ## Which roots actually build
 
@@ -262,6 +271,48 @@ workflow skips all of that: it applies the kernel-side SUSFS (the `50_add`
 patch and the `fs/`/`include/` sources), sets `CONFIG_KALLSYMS_ALL=y` because
 FinaSU's Kbuild demands it, and lets FinaSU's own code do the rest.
 
+### The hook backend (the "stuck at Google logo" fix)
+
+This one cost a night. FinaSU's syscall-hook backend is a Kconfig `choice` that
+**defaults to `KSU_HOOK_TRACEPOINT`**. But the SUSFS `50_add` patch wires its KSU
+entry points (`ksu_handle_execveat`, `ksu_handle_stat`, `ksu_handle_faccessat`, …)
+*inline* into `fs/exec.c`, `fs/stat.c`, `fs/open.c`, and friends. So a plain build
+ends up with **both** the tracepoint hooks *and* the patch's inline calls firing
+on the same syscalls — a double hook that panics in early boot, before the ROM's
+boot animation. (SUSFS itself initializes fine; the kernel just dies on the first
+hooked syscall.)
+
+FinaSU's own docs say it plainly: when the SUSFS patch is present, build with
+**`CONFIG_KSU_HOOK_SUSFS_INLINE=y`**, not tracepoint. So this workflow, when SUSFS
+is on, selects the Inline backend (`CONFIG_KSU_HOOK_SUSFS_INLINE=y`,
+`CONFIG_KSU_HOOK_TRACEPOINT` off) so FinaSU uses the patch's entry points *only* —
+no double hook. It also pins susfs4ksu to the commit FinaSU targets for
+`android15-6.6` (`4a4cb1be…`), which is the patch its Inline backend expects.
+
+If you flip `enable_susfs` **off**, none of this applies — FinaSU builds on its
+default tracepoint backend with no SUSFS, and boots fine (just without hiding).
+
+### Manager trust (the "Not installed" gotcha)
+
+FinaSU's dynamic manager auto-trusts exactly one signature — `KSU_EXPECTED_HASH`
+in its `kernel/Kbuild` — and that **defaults to weishu's KernelSU app**, not the
+FinaSU manager. FinaSU's own `build.sh` overrides it with the FinaSU manager's
+signing cert; a plain Kleaf build doesn't, so a self-built FinaSU kernel trusts
+the *KernelSU* manager and the FinaSU manager shows **"Not installed."**
+
+So the FinaSU build here bakes the FinaSU manager's signing cert into
+`kernel/Kbuild` (`KSU_EXPECTED_SIZE` / `KSU_EXPECTED_HASH`) right after the clone,
+so the official FinaSU manager is the one the kernel trusts. **It computes that
+signature live** — it fetches the current FinaSU manager APK from LyraVoid's
+Releases and runs `scripts/apk_sig.py` to extract the cert size + SHA-256, so it
+tracks FinaSU updates (v1.4.4 and beyond) on its own. If the fetch or the parse
+can't run (no network, `scripts/` not shipped), it falls back to the known
+v1.4.x cert (`0x02cc` / `2d89b50a…`), which stays valid as long as LyraVoid keeps
+the same app signing key — which Android requires for in-place updates anyway.
+Install the **official FinaSU manager from LyraVoid's Releases** and it comes up
+green. (Any other root's manager — KernelSU, KSU-Next, etc. — already uses its
+own upstream default and needs no help.)
+
 ## What's in here
 
 ```
@@ -277,6 +328,9 @@ kernel-patches/
   nv_guard/                              optional NV write guard LSM
     0001-nv_guard-...patch               ready to apply (patch -p1)
     nv_guard.c  Kconfig  Makefile        the same sources, to read by hand
+scripts/
+  apk_sig.py                             computes a manager APK's trusted cert
+                                         (used to bake FinaSU's manager signature)
 ```
 
 The driver and the minimal module are kept out here so you can read them; the

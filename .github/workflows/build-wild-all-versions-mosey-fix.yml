@@ -21,6 +21,10 @@ on:
         description: "Specific LTS Subversion (e.g. 6.6.144, 6.1.145, 6.12.92) or leave blank for latest LTS"
         type: string
         default: "6.6.144"
+      kernel_name:
+        description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
+        type: string
+        default: ""
       page_size:
         description: "ARM64 Memory Page Size (4k standard, 16k for supported 6.6/6.12 targets)"
         type: choice
@@ -74,6 +78,10 @@ on:
         description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
         type: boolean
         default: true
+      ship_nomount:
+        description: "Also fetch + attach the NoMount module (maxsteeel/nomount, latest) so its version matches the kernel - avoids the NoMount driver/module mismatch"
+        type: boolean
+        default: false
       enable_bbg:
         description: "Enable Baseband Guard (BBG) LSM Partition Protection"
         type: boolean
@@ -448,6 +456,37 @@ jobs:
 
           if [ -f "$DRIVERS_DIR/Kconfig" ] && ! grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
+          fi
+
+          # FinaSU manager trust: bake the CURRENT FinaSU manager's signing cert
+          # as the auto-trusted slot. Without this, FinaSU's dynamic-manager
+          # default trusts only weishu's KernelSU app and the FinaSU manager
+          # shows "Not installed". We compute the signature from the actual
+          # latest manager APK so it tracks FinaSU updates (v1.4.4+), and fall
+          # back to the known v1.4.x cert if the fetch/compute can't run.
+          if [ "${{ matrix.root_variant }}" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
+            FINA_SZ="0x02cc"
+            FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
+            FMGR="$(ls "$GITHUB_WORKSPACE"/managers/*.apk 2>/dev/null | head -1)"
+            if [ -z "$FMGR" ]; then
+              mkdir -p "$RUNNER_TEMP/fmgr"
+              GH_TOKEN="${{ github.token }}" gh release download --repo LyraVoid/FinaSU --pattern '*.apk' --dir "$RUNNER_TEMP/fmgr" 2>/dev/null || true
+              FMGR="$(ls "$RUNNER_TEMP"/fmgr/*.apk 2>/dev/null | head -1)"
+            fi
+            if [ -n "$FMGR" ] && [ -f "$GITHUB_WORKSPACE/scripts/apk_sig.py" ]; then
+              SIG="$(python3 "$GITHUB_WORKSPACE/scripts/apk_sig.py" "$FMGR" 2>/dev/null)"
+              if printf '%s' "$SIG" | grep -qE '^0x[0-9a-f]+ [0-9a-f]{64}$'; then
+                FINA_SZ="${SIG%% *}"; FINA_HASH="${SIG##* }"
+                echo "[+] FinaSU manager sig computed from $(basename "$FMGR"): $FINA_SZ"
+              else
+                echo "::warning::FinaSU: live sig compute failed; using known v1.4.x fallback"
+              fi
+            fi
+            sed -i "s/^KSU_EXPECTED_SIZE := .*/KSU_EXPECTED_SIZE := $FINA_SZ/" "$ROOT_DIR/kernel/Kbuild"
+            sed -i "s/^KSU_EXPECTED_HASH := .*/KSU_EXPECTED_HASH := $FINA_HASH/" "$ROOT_DIR/kernel/Kbuild"
+            grep -q "$FINA_HASH" "$ROOT_DIR/kernel/Kbuild" \
+              && echo "[+] FinaSU: trusted manager baked ($FINA_SZ)" \
+              || echo "::warning::FinaSU: could not bake manager signature (Kbuild format changed)"
           fi
 
       - name: Apply SUSFS (${{ matrix.susfs_branch }}) & Regular WildKernels Feature Patches
@@ -1119,6 +1158,8 @@ jobs:
 
       - name: Configure Kernel (`gki_defconfig` & Kleaf Protected Exports for ${{ matrix.kernel_version }})
         shell: bash
+        env:
+          CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
         run: |
           cd kernel_workspace/common
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
@@ -1134,6 +1175,18 @@ jobs:
               echo "${key}=${val}" >> "$DEFCONFIG"
             fi
           }
+
+          # Custom kernel name (replaces the -maybe-dirty scm marker in uname).
+          # Read from an env var so a malicious input can't inject shell.
+          # CONFIG_LOCALVERSION adds the name; AUTO=n drops the git/dirty suffix.
+          if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
+            KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
+            if [ -n "$KN" ]; then
+              set_kconfig CONFIG_LOCALVERSION "\"-$KN\""
+              set_kconfig CONFIG_LOCALVERSION_AUTO n
+              echo "[+] Kernel name: -$KN"
+            fi
+          fi
 
           # Disable CONFIG_WERROR so unused-variable warnings in patched files never fail the build
           set_kconfig CONFIG_WERROR n
@@ -1520,3 +1573,24 @@ jobs:
         with:
           name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Manager"
           path: managers/*.apk
+
+      - name: Fetch NoMount module
+        if: ${{ inputs.ship_nomount == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p nomount_out
+          echo "[+] Fetching NoMount module (maxsteeel/nomount, latest release)..."
+          if gh release download --repo maxsteeel/nomount --pattern '*.zip' --dir nomount_out 2>/dev/null; then
+            echo "[+] NoMount module(s): $(ls nomount_out 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::could not fetch the NoMount module (no zip asset or repo unavailable); install it by hand"
+          fi
+
+      - name: Upload NoMount module
+        if: ${{ inputs.ship_nomount == true && hashFiles('nomount_out/*') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-NoMount"
+          path: nomount_out/*
