@@ -20,10 +20,6 @@ a Release if you ask them to.
 
 ## Using it
 
-Drop the workflow in `.github/workflows/`, push, then go to the Actions tab and
-run it. Pick your family and root, leave the rest on the defaults unless you
-know you want otherwise, and wait. When it's done:
-
 - `*-AnyKernel3.zip` is your kernel - flash it in recovery / AnyKernel3.
 - `*-Mosey-enabler.zip` is the Quick Share AirDrop module with the matching
   `wonder` kernel module already inside it. Flash it in KernelSU/Magisk if you
@@ -118,7 +114,7 @@ subcmds 1-5) and hands back a locally-administered MAC. There's no real radio
 underneath - it's there so `mosey_server`'s bring-up finishes. Which brings me
 to the Pixel 10 note.
 
-### Pixel 10 (blazer)
+### Pixel 10's series
 
 Pixel 10 runs the **6.6** kernel, so the FinaSU workflow defaults to
 `android15-6.6` at the latest LTS. That's the number that matters here - double
