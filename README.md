@@ -1,4 +1,4 @@
-# GKI builder — FinaSU, SUSFS, and Quick Share AirDrop
+# GKI builder - FinaSU, SUSFS, and Quick Share AirDrop
 
 This is how I build my GKI kernels without touching a local toolchain: push it,
 hit **Run workflow**, come back to a flashable zip. It covers the WildKernels
@@ -7,11 +7,11 @@ feature set, every root manager I use, SUSFS, and the Mosey add-on that brings
 
 There are two workflows:
 
-- **`build-finasu-mosey.yml`** — my daily driver. FinaSU, done the way FinaSU
+- **`build-finasu-mosey.yml`** - my daily driver. FinaSU, done the way FinaSU
   wants it (its own SUSFS, nothing stapled on), defaulted to the Pixel 10
   series (`android15-6.6`, latest LTS). If you're on FinaSU, use this.
-- **`build-wild-all-versions-mosey-fix.yml`** — the kitchen sink. Any of the
-  current GKI families — **6.1, 6.6, or 6.12** — any root manager (KernelSU-Next,
+- **`build-wild-all-versions-mosey-fix.yml`** - the kitchen sink. Any of the
+  current GKI families - **6.1, 6.6, or 6.12** - any root manager (KernelSU-Next,
   KernelSU, BakaSU, ReSukiSU, KowSU, FinaSU, or No Root), one at a time or `all`
   in one run.
 
@@ -24,7 +24,7 @@ Drop the workflow in `.github/workflows/`, push, then go to the Actions tab and
 run it. Pick your family and root, leave the rest on the defaults unless you
 know you want otherwise, and wait. When it's done:
 
-- `*-AnyKernel3.zip` is your kernel — flash it in recovery / AnyKernel3.
+- `*-AnyKernel3.zip` is your kernel - flash it in recovery / AnyKernel3.
 - `*-Mosey-enabler.zip` is the Quick Share AirDrop module with the matching
   `wonder` kernel module already inside it. Flash it in KernelSU/Magisk if you
   want Mosey. (No `mosey/enabler/` in the repo? Then you get a stripped
@@ -32,17 +32,18 @@ know you want otherwise, and wait. When it's done:
 - `*-Manager` is the matching root **manager app** (the APK) for whatever root
   you built, pulled from that project's latest release. The kernel already
   carries the in-kernel driver; this is just the userspace app so it's in one
-  place. It's best-effort — if a project doesn't publish an APK, the step skips
+  place. It's best-effort - if a project doesn't publish an APK, the step skips
   it and you install the manager by hand. (No manager artifact for *No Root*.)
-- `*-NoMount` (only when `ship_nomount` is on) is the NoMount module at its
-  current version, so it matches the kernel rather than mismatching the driver.
+- `*-NoMount` is the NoMount module at its current version, so it matches the
+  kernel rather than mismatching the driver. The FinaSU build always attaches it;
+  the all-versions builder gates it behind `ship_nomount`.
 
 > **Heads-up on GitHub artifacts:** downloading from the Actions tab always
 > wraps the file in an *outer* `.zip` (that's GitHub, not the build). Unzip that
 > once to get the real `...-AnyKernel3.zip` / enabler zip / `.apk`, then flash
-> the inner zip **as-is** — don't unzip the AnyKernel zip itself.
+> the inner zip **as-is** - don't unzip the AnyKernel zip itself.
 
-The runner does the whole thing itself — syncs the GKI manifest, pulls the
+The runner does the whole thing itself - syncs the GKI manifest, pulls the
 WildKernels patches, SUSFS and your root, patches and configures, compiles
 (Bazel/Kleaf, which all three families use), and packages. Nothing runs
 on your machine.
@@ -51,41 +52,41 @@ on your machine.
 
 Most toggles are self-explanatory. The handful that bite if you get them wrong:
 
-- **`kernel_build_version`** — the GKI family, or `all` to fan out across every
+- **`kernel_build_version`** - the GKI family, or `all` to fan out across every
   one of them at once (that's 3 families × 3 core roots = 9 jobs, so don't run
   it casually).
-- **`gki_lts_version`** — pin an exact LTS like `6.6.144`, or leave it blank and
+- **`gki_lts_version`** - pin an exact LTS like `6.6.144`, or leave it blank and
   take the newest.
-- **`page_size`** — `16k` only exists for 6.1 / 6.6 / 6.12, and it has to match
+- **`page_size`** - `16k` only exists for 6.1 / 6.6 / 6.12, and it has to match
   what your phone actually runs or it won't boot. When in doubt, 4k.
-- **`root_variant`** — on the all-versions builder, any manager; `All` fans out
+- **`root_variant`** - on the all-versions builder, any manager; `All` fans out
   to KernelSU-Next + KernelSU + BakaSU.
-- **`mosey_mode`** — `both`, `module`, or `disabled`. More on that below.
-- **`security_patches`** — `monthly` (default), `latest-cve`, or `none`. What
+- **`mosey_mode`** - `both`, `module`, or `disabled`. More on that below.
+- **`security_patches`** - `monthly` (default), `latest-cve`, or `none`. What
   these mean, and why `latest-cve` comes with a warning, is its own section
   below. If you don't have a reason to touch it, leave it on `monthly`.
-- **`kernel_name`** — a custom name for `uname` (e.g. `Dev_DcS`). Blank keeps
+- **`kernel_name`** - a custom name for `uname` (e.g. `Dev_DcS`). Blank keeps
   the stock string; set it and it replaces the `-maybe-dirty` marker, so you get
-  `6.6.144-android15-8-Dev_DcS` instead of `…-maybe-dirty-4k`.
-- **`ship_nomount`** — off by default. On, the build also pulls the current
-  NoMount module (maxsteeel/nomount) and attaches it as a `*-NoMount` artifact,
-  so the module version lines up with the kernel instead of showing a driver
-  mismatch.
+  `6.6.144-android15-8-Dev_DcS` instead of `...-maybe-dirty-4k`.
+- **`ship_nomount`** (all-versions builder only) - off by default. On, the build
+  also pulls the current NoMount module (maxsteeel/nomount) and attaches it as a
+  `*-NoMount` artifact, so the module version lines up with the kernel instead of
+  showing a driver mismatch. The FinaSU build does this automatically, no toggle.
 
 ## Which roots actually build
 
 I compile-tested each root's `drivers/kernelsu` against a real SUSFS-patched 6.6
 tree, wired the way the workflow wires it. Status as of the last check:
 
-- **KernelSU** (tiann + susfs4ksu's `10_enable`) — builds.
-- **KernelSU-Next** (pershoot `dev-susfs`, native SUSFS) — builds.
-- **BakaSU** (native SUSFS + its compat symbols + `KALLSYMS_ALL`) — builds.
-- **KowSU** (no SUSFS, SUSFS-off) — builds.
-- **FinaSU** (native SUSFS) — builds.
-- **ReSukiSU** (native SUSFS) — builds.
+- **KernelSU** (tiann + susfs4ksu's `10_enable`) - builds.
+- **KernelSU-Next** (pershoot `dev-susfs`, native SUSFS) - builds.
+- **BakaSU** (native SUSFS + its compat symbols + `KALLSYMS_ALL`) - builds.
+- **KowSU** (no SUSFS, SUSFS-off) - builds.
+- **FinaSU** (native SUSFS) - builds.
+- **ReSukiSU** (native SUSFS) - builds.
 
 Why ReSukiSU and not SukiSU-Ultra: I ran SukiSU-Ultra first and it wouldn't
-compile against current susfs4ksu — its `builtin` branch calls
+compile against current susfs4ksu - its `builtin` branch calls
 `susfs_parse_priority_app_strings()` unconditionally but never defines
 `CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER` in its own Kconfig, so the link dies on a
 missing symbol. KernelSU-Next guards the exact same call behind an `#ifdef` and
@@ -97,7 +98,7 @@ own dedicated workflow on top.
 ## Why not 5.x or 6.18
 
 The build list is **6.1 / 6.6 / 6.12** on purpose. The old 5.10/5.15 families
-are dropped — they're legacy and I don't ship them. 6.18 is left out too: there
+are dropped - they're legacy and I don't ship them. 6.18 is left out too: there
 isn't an upstream SUSFS branch for `android17-6.18` yet (SUSFS stops at 6.12),
 so a 6.18 build would come out SUSFS-off and the SUSFS-dependent roots couldn't
 run on it. Once SUSFS tags a 6.18 branch it can go back in; for now the three
@@ -105,7 +106,7 @@ families above are the ones that actually build with the full feature set.
 
 ## Mosey (AirDrop in Quick Share)
 
-The kernel side is `mosey/wonder_mosey_wild.c` — a cfg80211-only virtual phy
+The kernel side is `mosey/wonder_mosey_wild.c` - a cfg80211-only virtual phy
 called `wonder`. GKI ships cfg80211 as a vendor module and never builds
 mac80211 into the image, so this driver leans only on the cfg80211 the phone
 already has and is built out-of-tree against the kernel you just compiled, then
@@ -113,20 +114,20 @@ dropped into the module. Your kernel image stays exactly what a normal build
 produces.
 
 It answers the vendor commands `mosey_server` pokes it with (OUI `0x001A11`,
-subcmds 1–5) and hands back a locally-administered MAC. There's no real radio
-underneath — it's there so `mosey_server`'s bring-up finishes. Which brings me
+subcmds 1-5) and hands back a locally-administered MAC. There's no real radio
+underneath - it's there so `mosey_server`'s bring-up finishes. Which brings me
 to the Pixel 10 note.
 
-### Pixel 10's
+### Pixel 10 (blazer)
 
 Pixel 10 runs the **6.6** kernel, so the FinaSU workflow defaults to
-`android15-6.6` at the latest LTS. That's the number that matters here — double
+`android15-6.6` at the latest LTS. That's the number that matters here - double
 check it against `uname -r` on your phone, and leave `page_size` at 4k unless
 `getconf PAGE_SIZE` says 16384.
 
 On Mosey specifically: Pixel 10's BCM4398 already does the `wondertap` dance in
 hardware, so AirDrop-in-Quick-Share works off the real radio. The bundled
-virtual phy knows to get out of the way — `wonder-load.sh` checks for a native
+virtual phy knows to get out of the way - `wonder-load.sh` checks for a native
 `wonder` phy and does nothing if it finds one. So on a Pixel 10 you're really
 flashing this for the **kernel** (rooted, SUSFS hiding, integrity) and Mosey
 just keeps running on the hardware. The virtual phy is for devices that don't
@@ -134,14 +135,14 @@ have wondertap at all.
 
 ### The bundled enabler
 
-`mosey/enabler/` is the userspace half — `mosey_server`, the bridge shim,
+`mosey/enabler/` is the userspace half - `mosey_server`, the bridge shim,
 SELinux policy, the Wi-Fi bits, the WebUI switch, the watchdog. **This is
 feelliao's Mosey enabler**; I've only added the kernel glue (`wonder-load.sh`
 and one line in its `post-fs-data.sh`) so the build can bake the matching
 `wonder_mosey_wild.ko` straight in and hand you one flashable module instead of
 two. See `mosey/enabler/NOTICE-wonder.md` for exactly what's feelliao's and
 what's mine. A heads-up: the enabler's radio files (`bdwlan*`,
-`WCNSS_qcom_cfg.ini`, LOWI) are Qualcomm's — they do nothing on Pixel's
+`WCNSS_qcom_cfg.ini`, LOWI) are Qualcomm's - they do nothing on Pixel's
 Broadcom stack, which is fine, Pixel doesn't need them.
 
 ### If the MAC reply format is wrong
@@ -155,14 +156,14 @@ echo 1 > /sys/module/wonder_mosey_wild/parameters/mac_reply_fmt
 
 ## Integrity
 
-The FinaSU build turns on the whole SUSFS hide set — path, mount, kstat, uname
-and bootconfig/cmdline spoof, open-redirect, map hiding, kallsyms hiding — and
+The FinaSU build turns on the whole SUSFS hide set - path, mount, kstat, uname
+and bootconfig/cmdline spoof, open-redirect, map hiding, kallsyms hiding - and
 FinaSU's dynamic manager keeps the manager itself hidden. That's the kernel
 doing its part.
 
 It is not the whole story, so don't get your hopes up that flashing this alone
 passes Play Integrity. BASIC/DEVICE still needs userspace the kernel can't
-carry — a TrickyStore keybox and a PlayIntegrityFix/Next module. Flash those
+carry - a TrickyStore keybox and a PlayIntegrityFix/Next module. Flash those
 too, and don't go spoofing your build fingerprint to a Pixel 10 just to chase
 Mosey; it'll only fight your integrity setup.
 
@@ -171,26 +172,26 @@ Mosey; it'll only fight your integrity setup.
 The `security_patches` input picks how aggressive you want to be about CVE
 fixes. Three settings:
 
-- **`monthly`** (default) — the sane one. Your base is the latest tagged GKI /
+- **`monthly`** (default) - the sane one. Your base is the latest tagged GKI /
   LTS release, and that tag already carries the Android monthly security
   bulletin CVE set, backported and tested *together* upstream by Google and the
   stable maintainers. Nothing extra is applied. This is what you want unless you
   have a specific reason not to.
-- **`latest-cve`** — on top of the monthly base, the build fast-forwards this
+- **`latest-cve`** - on top of the monthly base, the build fast-forwards this
   series' **post-release** stable CVE fixes (the commits that landed on
   `linux-<ver>.y` *after* the last numbered release) and applies them with
   `git am --3way`. Anything that doesn't apply cleanly is **aborted and logged,
   never force-fuzzed in**. You get `cve-out/cve-applied.txt` and
   `cve-out/cve-skipped.txt` listing exactly what went in and what didn't.
-- **`none`** — apply nothing extra; build the base exactly as pinned.
+- **`none`** - apply nothing extra; build the base exactly as pinned.
 
 > ⚠️ **Read before you pick `latest-cve`.** These are patches that haven't made
-> it into a tagged release yet — they're newer and less-baked than the monthly
+> it into a tagged release yet - they're newer and less-baked than the monthly
 > set. Specifically:
 >
 > - They are applied best-effort. If the base tag isn't reachable in the synced
 >   tree, or the stable tree can't be fetched, the step **warns and applies
->   nothing** — your build silently falls back to the monthly base. Check the
+>   nothing** - your build silently falls back to the monthly base. Check the
 >   log and `cve-out/` to see what actually happened; don't assume.
 > - A patch that conflicts is skipped, not fixed. So `latest-cve` can leave you
 >   with a *partial* set, which is a weird state to reason about security-wise.
@@ -207,29 +208,30 @@ fixes. Three settings:
 
 If you've ever had a Tensor/Exynos "Shannon" radio go dead after a bootloop,
 this is for you. Two NV blobs live on the efs/vendor partition:
-`nv_normal.bin` (the modem's working state — if it gets wiped the modem just
-rebuilds it) and `nv_protected.bin` (RF calibration and your IMEIs — lose or
+`nv_normal.bin` (the modem's working state - if it gets wiped the modem just
+rebuilds it) and `nv_protected.bin` (RF calibration and your IMEIs - lose or
 corrupt that one and the radio doesn't come back). The classic brick is a
 *torn* write to `nv_protected.bin`: power cut or a reboot lands mid-write and
 you're left with half a file.
 
 `kernel-patches/nv_guard/` is a tiny LSM that does exactly one thing: it
 refuses write-opens, unlinks and renames of `nv_protected.bin` unless you
-explicitly unlock it. **`nv_normal.bin` is deliberately left writable** — that's
+explicitly unlock it. **`nv_normal.bin` is deliberately left writable** - that's
 the blob the modem is *supposed* to rewrite, and the one you wipe to recover a
 confused radio, so guarding it would do more harm than good. The guard only
 stands between a bad actor (or a bad write) and the data you can't get back.
 
-Turn it on with the **`nv_write_guard`** toggle when you run a build (it's a
-boolean, defaults to **off**). With it off, the build is byte-for-byte what it
-always was — nothing is copied or configured. With it on, the workflow copies
+Turn it on with the **`security_guards`** box when you run a build - pick
+`bbg+nv` (or `nv` for NV guard alone); it's **off** by default (`bbg` = just
+Baseband-Guard). With NV off, the build is byte-for-byte what it always was -
+nothing is copied or configured. With it on, the workflow copies
 `kernel-patches/nv_guard/` into `security/nv_guard/`, wires it into
 `security/Kconfig` and `security/Makefile` **by anchor** (not a version-specific
-diff, so it's safe on every GKI series we build — 6.1, 6.6 and 6.12), sets
+diff, so it's safe on every GKI series we build - 6.1, 6.6 and 6.12), sets
 `CONFIG_NV_WRITE_GUARD=y`, and adds `nv_guard` to the active LSM list. If
 `kernel-patches/` isn't in the repo, the step warns and skips rather than
 failing the build. The bundled `.patch` is just a 6.6-cut copy for applying by
-hand — the workflow uses the sources directly, not the patch, which is why it
+hand - the workflow uses the sources directly, not the patch, which is why it
 no longer corrupts `security/Kconfig` on the older trees.
 
 Runtime knobs live under `/sys/module/nv_guard/parameters`:
@@ -247,16 +249,16 @@ echo 'nv_protected.bin,nv.bin' > /sys/module/nv_guard/parameters/names
 **Be honest with yourself about what this does and doesn't catch.** It's a
 VFS-path guard, so it covers the normal case where efs is a mounted filesystem
 and something opens the file to write it. It does **not** see a modem that DMAs
-straight to the raw partition (that's block-device territory — Baseband-guard,
+straight to the raw partition (that's block-device territory - Baseband-guard,
 already in this build, is what guards the partition node), it won't retroactively
 close an fd that's already open, and it matches on filename, so a protected name
 is protected wherever it lives. It's also not a substitute for a bootloop
-protector — if you're bootlooping, fix that too. Think of it as a seatbelt for
+protector - if you're bootlooping, fix that too. Think of it as a seatbelt for
 the one file you can't replace, not a force field.
 
 Status: the LSM object compiles clean against a SUSFS-patched `android15-6.6`
 tree with the same clang/LLVM toolchain the workflow uses. I have **not**
-flashed it to a device — treat the on-device behaviour as "should work, test it
+flashed it to a device - treat the on-device behaviour as "should work, test it
 yourself on something you can recover," and keep an `efs` backup before you flip
 it on. Standard "it's your radio" caveat applies.
 
@@ -264,7 +266,7 @@ it on. Standard "it's your radio" caveat applies.
 
 FinaSU already has SUSFS built in (`kernel/extension/susfs.c`). The generic
 WildKernels path assumes a KernelSU that doesn't, so it runs the tiann
-"enable SUSFS" patch plus the `finasu_compat` fix-ups on top — and against
+"enable SUSFS" patch plus the `finasu_compat` fix-ups on top - and against
 current FinaSU those half-apply and wreck `core/init.c` and `selinux_hide.c`
 (if you ever saw `ksu_app_profile_init` undeclared, that was it). So the FinaSU
 workflow skips all of that: it applies the kernel-side SUSFS (the `50_add`
@@ -275,27 +277,27 @@ FinaSU's Kbuild demands it, and lets FinaSU's own code do the rest.
 
 This one cost a night. FinaSU's syscall-hook backend is a Kconfig `choice` that
 **defaults to `KSU_HOOK_TRACEPOINT`**. But the SUSFS `50_add` patch wires its KSU
-entry points (`ksu_handle_execveat`, `ksu_handle_stat`, `ksu_handle_faccessat`, …)
+entry points (`ksu_handle_execveat`, `ksu_handle_stat`, `ksu_handle_faccessat`, ...)
 *inline* into `fs/exec.c`, `fs/stat.c`, `fs/open.c`, and friends. So a plain build
 ends up with **both** the tracepoint hooks *and* the patch's inline calls firing
-on the same syscalls — a double hook that panics in early boot, before the ROM's
+on the same syscalls - a double hook that panics in early boot, before the ROM's
 boot animation. (SUSFS itself initializes fine; the kernel just dies on the first
 hooked syscall.)
 
 FinaSU's own docs say it plainly: when the SUSFS patch is present, build with
 **`CONFIG_KSU_HOOK_SUSFS_INLINE=y`**, not tracepoint. So this workflow, when SUSFS
 is on, selects the Inline backend (`CONFIG_KSU_HOOK_SUSFS_INLINE=y`,
-`CONFIG_KSU_HOOK_TRACEPOINT` off) so FinaSU uses the patch's entry points *only* —
+`CONFIG_KSU_HOOK_TRACEPOINT` off) so FinaSU uses the patch's entry points *only* -
 no double hook. It also pins susfs4ksu to the commit FinaSU targets for
-`android15-6.6` (`4a4cb1be…`), which is the patch its Inline backend expects.
+`android15-6.6` (`4a4cb1be...`), which is the patch its Inline backend expects.
 
-If you flip `enable_susfs` **off**, none of this applies — FinaSU builds on its
+If you flip `enable_susfs` **off**, none of this applies - FinaSU builds on its
 default tracepoint backend with no SUSFS, and boots fine (just without hiding).
 
 ### Manager trust (the "Not installed" gotcha)
 
-FinaSU's dynamic manager auto-trusts exactly one signature — `KSU_EXPECTED_HASH`
-in its `kernel/Kbuild` — and that **defaults to weishu's KernelSU app**, not the
+FinaSU's dynamic manager auto-trusts exactly one signature - `KSU_EXPECTED_HASH`
+in its `kernel/Kbuild` - and that **defaults to weishu's KernelSU app**, not the
 FinaSU manager. FinaSU's own `build.sh` overrides it with the FinaSU manager's
 signing cert; a plain Kleaf build doesn't, so a self-built FinaSU kernel trusts
 the *KernelSU* manager and the FinaSU manager shows **"Not installed."**
@@ -303,14 +305,14 @@ the *KernelSU* manager and the FinaSU manager shows **"Not installed."**
 So the FinaSU build here bakes the FinaSU manager's signing cert into
 `kernel/Kbuild` (`KSU_EXPECTED_SIZE` / `KSU_EXPECTED_HASH`) right after the clone,
 so the official FinaSU manager is the one the kernel trusts. **It computes that
-signature live** — it fetches the current FinaSU manager APK from LyraVoid's
+signature live** - it fetches the current FinaSU manager APK from LyraVoid's
 Releases and runs `scripts/apk_sig.py` to extract the cert size + SHA-256, so it
 tracks FinaSU updates (v1.4.4 and beyond) on its own. If the fetch or the parse
 can't run (no network, `scripts/` not shipped), it falls back to the known
-v1.4.x cert (`0x02cc` / `2d89b50a…`), which stays valid as long as LyraVoid keeps
-the same app signing key — which Android requires for in-place updates anyway.
+v1.4.x cert (`0x02cc` / `2d89b50a...`), which stays valid as long as LyraVoid keeps
+the same app signing key - which Android requires for in-place updates anyway.
 Install the **official FinaSU manager from LyraVoid's Releases** and it comes up
-green. (Any other root's manager — KernelSU, KSU-Next, etc. — already uses its
+green. (Any other root's manager - KernelSU, KSU-Next, etc. - already uses its
 own upstream default and needs no help.)
 
 ## What's in here
@@ -319,6 +321,10 @@ own upstream default and needs no help.)
 .github/workflows/
   build-finasu-mosey.yml                 FinaSU, Pixel 10 defaults
   build-wild-all-versions-mosey-fix.yml  6.1 / 6.6 / 6.12, all roots
+  build-integrity-tools.yml              fetch latest integrity modules -> Integrity_Tools.zip
+integrity/
+  INSTALL_ORDER.md                       the Strong/Certified/locked-bootloader combo + caveats
+  keybox-autopilot/                      my keybox + target manager module (WebUI) @Dev_DcS
 mosey/
   wonder_mosey_wild.c                    the cfg80211 wonder driver
   Kbuild
@@ -331,44 +337,94 @@ kernel-patches/
 scripts/
   apk_sig.py                             computes a manager APK's trusted cert
                                          (used to bake FinaSU's manager signature)
+  fetch_integrity_tools.sh               pulls newest build of each integrity tool
+sources/                                 vendored, pinned build inputs (see below)
+  finasu/kernel/                         FinaSU @2d5786b9 -> drivers/kernelsu
+  susfs4ksu/kernel_patches/              susfs @4a4cb1be (the FinaSU-pinned commit)
+  wild_patches/                          WildKernels common/ + gki_ptrace.patch
+  baseband-guard/                        Baseband-guard @028ff7f
+  UPSTREAM.md                            provenance + how to move a pin forward
 ```
 
 The driver and the minimal module are kept out here so you can read them; the
 workflow carries its own inline copy of the driver, so it builds on GitHub
 without needing to check `mosey/` out.
 
+## Vendored sources
+
+Everything that gets **compiled into the kernel** is shipped in `sources/`,
+pinned, and the FinaSU workflow uses those copies first - it only clones
+upstream if a `sources/` directory is missing. The result is a reproducible
+build that keeps working even if an upstream repo is force-pushed, retagged, or
+deleted, and the FinaSU tree it pins is exactly the one that currently boots.
+
+`susfs4ksu` is already checked out at the commit FinaSU pins, so the workflow
+skips the clone-and-`git checkout` step entirely when it's vendored.
+Baseband-guard is wired by its own `setup.sh`; a throwaway `git init` (no
+remote) is dropped in first so that script takes its no-fetch path and the pin
+holds.
+
+Deliberately **not** vendored: the FinaSU manager APK, NoMount, and AnyKernel3.
+Those are userspace/packaging, not compiled into the kernel, and the manager
+must stay current so the baked manager-signature trust (`scripts/apk_sig.py`)
+matches whatever manager release is live. To refresh any pin, drop a fresh
+checkout into the matching `sources/` folder and update `sources/UPSTREAM.md`.
+
+## Integrity tooling
+
+Passing Play Integrity is almost entirely **userspace** - the kernel's only job
+is hiding (SUSFS), which this build already maxes out. So the integrity help here
+is about gathering and managing the userspace pieces, not another kernel knob.
+
+- **`build-integrity-tools.yml`** - run it on demand to bundle the newest build of
+  Duck-ToolBox, OhMyKeymint (OMK), PlayIntegrityFork, TEESimulator-RS and HMA-OSS,
+  plus Keybox Autopilot, into **`Integrity_Tools.zip`** (a workflow artifact; it can
+  also publish a release). Pulls the newest tag of each, canaries included.
+- **`integrity_bundle` box** on the FinaSU build - tick it and the same bundle is
+  produced alongside the kernel in one run, with `INSTALL_ORDER.md` for the
+  Strong/Certified/locked-bootloader (avbroot) combo.
+- **Keybox Autopilot** (`integrity/keybox-autopilot`, @Dev_DcS) - a WebUI module that
+  fetches a keybox from a source you set, refuses it if it's revoked (checked against
+  Google's attestation status list), and keeps TrickyStore's `keybox.xml` + `target.txt`
+  in sync for a recommended app set plus your own picks.
+
+**The honest ceiling:** Certified + Device are realistic and stable. **Strong is gated
+on a valid, non-revoked hardware keybox** - nobody can mint one and leaked ones get
+revoked fast, so no combo passes Strong "flawlessly" forever. That's exactly why Keybox
+Autopilot exists. Full detail and flash order in `integrity/INSTALL_ORDER.md`.
+
 ## Thanks
 
-Big one first: **feelliao** — the entire userspace Mosey enabler under
+Big one first: **feelliao** - the entire userspace Mosey enabler under
 `mosey/enabler/` is their work; all I did was bake a kernel-matched `wonder`
 phy into it.
 
 And the rest of the shoulders this stands on:
 
-- **SUSFS** — simonpunk — https://gitlab.com/simonpunk/susfs4ksu
-- **WildKernels** — the patches and the pipeline this grew out of —
+- **SUSFS** - simonpunk - https://gitlab.com/simonpunk/susfs4ksu
+- **WildKernels** - the patches and the pipeline this grew out of -
   https://github.com/WildKernels
-- **FinaSU** — LyraVoid — https://github.com/LyraVoid/FinaSU
-- **KernelSU** — tiann — https://github.com/tiann/KernelSU
-- **KernelSU-Next** — https://github.com/KernelSU-Next/KernelSU-Next
-- **BakaSU** — https://github.com/Baka-SU/BakaSU
-- **ReSukiSU** — https://github.com/ReSukiSU/ReSukiSU (fork of SukiSU-Ultra —
+- **FinaSU** - LyraVoid - https://github.com/LyraVoid/FinaSU
+- **KernelSU** - tiann - https://github.com/tiann/KernelSU
+- **KernelSU-Next** - https://github.com/KernelSU-Next/KernelSU-Next
+- **BakaSU** - https://github.com/Baka-SU/BakaSU
+- **ReSukiSU** - https://github.com/ReSukiSU/ReSukiSU (fork of SukiSU-Ultra -
   https://github.com/SukiSU-Ultra/SukiSU-Ultra)
-- **Baseband-guard** — vc-teahouse — https://github.com/vc-teahouse/Baseband-guard
-- **Mosey Extended** (the whole wonder / Quick Share effort) — thelok1s —
+- **Baseband-guard** - vc-teahouse - https://github.com/vc-teahouse/Baseband-guard
+- **Mosey Extended** (the whole wonder / Quick Share effort) - thelok1s -
   https://github.com/thelok1s/mosey-extended
-- **DroidSpaces-OSS** — ravindu644 — https://github.com/ravindu644/Droidspaces-OSS
-- **NoMount** — maxsteeel — https://github.com/maxsteeel/nomount
-- **AnyKernel3** — osm0sis — https://github.com/osm0sis/AnyKernel3
+- **DroidSpaces-OSS** - ravindu644 - https://github.com/ravindu644/Droidspaces-OSS
+- **NoMount** - maxsteeel - https://github.com/maxsteeel/nomount
+- **AnyKernel3** - osm0sis - https://github.com/osm0sis/AnyKernel3
 - **Google / AOSP** for the GKI common kernel.
 
 Missed someone? That's on me, open an issue and I'll add you.
 
 ## License
 
-GPL-2.0-only — the module links the kernel, so it can't be anything else.
+GPL-2.0-only - the module links the kernel, so it can't be anything else.
 See [LICENSE](LICENSE).
 
 ---
 
-— **@Dev_DcS**
+- **@Dev_DcS**

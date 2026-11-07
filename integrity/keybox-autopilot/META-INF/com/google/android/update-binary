@@ -1,0 +1,21 @@
+#!/sbin/sh
+
+umask 022
+
+ui_print() { echo "$1"; }
+
+# read by util_functions.sh's install_module
+# shellcheck disable=SC2034
+OUTFD=$2
+# shellcheck disable=SC2034
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+if [ ! -f /data/adb/magisk/util_functions.sh ]; then
+  ui_print "Install this from the KernelSU or Magisk app."
+  exit 1
+fi
+. /data/adb/magisk/util_functions.sh
+install_module
+exit 0
