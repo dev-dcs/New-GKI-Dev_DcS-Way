@@ -694,8 +694,16 @@ jobs:
               OUTD="$GITHUB_WORKSPACE/cve-out"; mkdir -p "$OUTD"
               OKF="$OUTD/cve-applied.txt"; SKF="$OUTD/cve-skipped.txt"; : > "$OKF"; : > "$SKF"
               STABLE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git"
-              if git fetch --no-tags --depth=400 "$STABLE" "linux-${SERIES}.y:refs/cve_tip" 2>/dev/null; then
-                if git rev-parse "v${KVER}" >/dev/null 2>&1; then
+              # The synced Android tree never carries upstream stable tags, so the
+              # base tag has to come from linux-stable too, or it's never found.
+              if git fetch --no-tags --depth=400 "$STABLE" "linux-${SERIES}.y:refs/cve_tip" "refs/tags/v${KVER}:refs/tags/v${KVER}" 2>/dev/null; then
+                # The base must sit inside the fetched history, otherwise rev-list
+                # walks past it into commits the tree already has. Deepen until it does.
+                for d in 800 1600 3200; do
+                  git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null && break
+                  git fetch --no-tags --deepen="$d" "$STABLE" "linux-${SERIES}.y:refs/cve_tip" 2>/dev/null || break
+                done
+                if git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null; then
                   mapfile -t SHAS < <(git rev-list --reverse "v${KVER}..refs/cve_tip" 2>/dev/null)
                   echo "[i] ${SERIES}: ${#SHAS[@]} post-${KVER} stable commits to try"
                   for sha in "${SHAS[@]}"; do
