@@ -1,0 +1,7 @@
+id=keybox_autopilot
+name=Keybox Autopilot
+version=v1.0.0
+versionCode=10000
+author=@Dev_DcS
+description=Auto-fetches a keybox from a source you set, revocation-checks it against Google's attestation status list, and keeps TrickyStore's keybox + target list in sync for a recommended app set plus your own picks. WebUI included.
+updateJson=

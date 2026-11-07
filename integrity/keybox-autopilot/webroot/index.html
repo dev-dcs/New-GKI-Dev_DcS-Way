@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Keybox Autopilot</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Keybox Autopilot</h1>
+  <span class="by">@Dev_DcS</span>
+</header>
+
+<main>
+  <section class="card" id="status-card">
+    <h2>Status</h2>
+    <div class="row"><span>Keybox installed</span><b id="st-keybox">...</b></div>
+    <div class="row"><span>Backend (TrickyStore)</span><b id="st-backend">...</b></div>
+    <div class="row"><span>Last sync</span><b id="st-last">...</b></div>
+    <button id="btn-sync" class="primary">Fetch &amp; apply now</button>
+  </section>
+
+  <section class="card">
+    <h2>Source</h2>
+    <p class="hint">URL that returns a <code>keybox.xml</code>. Leave empty until you
+    have one you trust - a revoked keybox is refused automatically.</p>
+    <input id="in-source" type="url" placeholder="https://.../keybox.xml" autocomplete="off">
+    <div class="grid2">
+      <label>Refresh (hours)<input id="in-refresh" type="number" min="0" max="168"></label>
+      <label class="chk"><input id="in-recommended" type="checkbox"> Apply recommended apps</label>
+    </div>
+    <button id="btn-save">Save settings</button>
+  </section>
+
+  <section class="card">
+    <h2>Target apps</h2>
+    <p class="hint">Recommended set (Play Store, Play Services, Wallet, GPay) is added
+    automatically when enabled above. Add your banks / others here.</p>
+    <div class="addrow">
+      <input id="in-pkg" type="text" placeholder="com.your.bank" autocomplete="off">
+      <button id="btn-add">Add</button>
+    </div>
+    <ul id="target-list"></ul>
+  </section>
+
+  <section class="card">
+    <h2>Log</h2>
+    <pre id="log">...</pre>
+  </section>
+</main>
+
+<footer>Keybox Autopilot · @Dev_DcS · works alongside TrickyStore / TEESimulator</footer>
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

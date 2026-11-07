@@ -1,0 +1,6 @@
+id=re_kernel_devdcs
+name=Re-Kernel (@Dev_DcS)
+version=@KREL@
+versionCode=@VC@
+author=@Dev_DcS (module: Sakion Team)
+description=Loads Re-Kernel (binder/signal/netfilter netlink events) built for this exact kernel @KREL@. Needs a userspace consumer to act on the events; harmless if none is present.

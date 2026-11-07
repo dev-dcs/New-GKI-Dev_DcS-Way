@@ -467,14 +467,14 @@ jobs:
           if [ "${{ matrix.root_variant }}" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
             FINA_SZ="0x02cc"
             FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
-            FMGR="$(ls "$GITHUB_WORKSPACE"/managers/*.apk 2>/dev/null | head -1)"
+            FMGR="$(ls "$GITHUB_WORKSPACE"/managers/*.apk 2>/dev/null | head -1 || true)"
             if [ -z "$FMGR" ]; then
               mkdir -p "$RUNNER_TEMP/fmgr"
               GH_TOKEN="${{ github.token }}" gh release download --repo LyraVoid/FinaSU --pattern '*.apk' --dir "$RUNNER_TEMP/fmgr" 2>/dev/null || true
-              FMGR="$(ls "$RUNNER_TEMP"/fmgr/*.apk 2>/dev/null | head -1)"
+              FMGR="$(ls "$RUNNER_TEMP"/fmgr/*.apk 2>/dev/null | head -1 || true)"
             fi
             if [ -n "$FMGR" ] && [ -f "$GITHUB_WORKSPACE/scripts/apk_sig.py" ]; then
-              SIG="$(python3 "$GITHUB_WORKSPACE/scripts/apk_sig.py" "$FMGR" 2>/dev/null)"
+              SIG="$(python3 "$GITHUB_WORKSPACE/scripts/apk_sig.py" "$FMGR" 2>/dev/null || true)"
               if printf '%s' "$SIG" | grep -qE '^0x[0-9a-f]+ [0-9a-f]{64}$'; then
                 FINA_SZ="${SIG%% *}"; FINA_HASH="${SIG##* }"
                 echo "[+] FinaSU manager sig computed from $(basename "$FMGR"): $FINA_SZ"
@@ -634,7 +634,7 @@ jobs:
               echo "[+] security_patches=latest-cve: topping up with post-release stable CVE fixes..."
               git config user.email "ci@local" 2>/dev/null || true
               git config user.name "ci" 2>/dev/null || true
-              KVER="$(make -s kernelversion 2>/dev/null)"
+              KVER="$(make -s kernelversion 2>/dev/null || true)"
               SERIES="$(echo "$KVER" | cut -d. -f1-2)"
               OUTD="$GITHUB_WORKSPACE/cve-out"; mkdir -p "$OUTD"
               OKF="$OUTD/cve-applied.txt"; SKF="$OUTD/cve-skipped.txt"; : > "$OKF"; : > "$SKF"
@@ -644,7 +644,7 @@ jobs:
                   mapfile -t SHAS < <(git rev-list --reverse "v${KVER}..refs/cve_tip" 2>/dev/null)
                   echo "[i] ${SERIES}: ${#SHAS[@]} post-${KVER} stable commits to try"
                   for sha in "${SHAS[@]}"; do
-                    subj="$(git log -1 --format='%s' "$sha" 2>/dev/null)"
+                    subj="$(git log -1 --format='%s' "$sha" 2>/dev/null || true)"
                     if git format-patch -1 --stdout "$sha" 2>/dev/null | git am --3way >/dev/null 2>&1; then
                       echo "$sha  $subj" >> "$OKF"
                     else
@@ -1260,7 +1260,7 @@ jobs:
           done
 
 
-      - name: Compile Kernel (${{ matrix.kernel_version }} — Auto Bazel / build.sh Dispatch)
+      - name: Compile Kernel (${{ matrix.kernel_version }} - Auto Bazel / build.sh Dispatch)
         shell: bash
         run: |
           cd kernel_workspace

@@ -1,0 +1,59 @@
+name: Fetch Integrity Tools (Integrity_Tools.zip)
+
+# Pulls the newest build of each integrity module (incl. canary pre-releases)
+# and bundles them, plus my Keybox Autopilot module, into Integrity_Tools.zip.
+# @Dev_DcS
+
+on:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: "Also publish the zip as a GitHub Release (tag: integrity-tools-latest)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for Keybox Autopilot + fetch script)
+        uses: actions/checkout@v4
+
+      - name: Fetch latest integrity tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          chmod +x scripts/fetch_integrity_tools.sh
+          scripts/fetch_integrity_tools.sh "$GITHUB_WORKSPACE/Integrity_Tools" "$GITHUB_WORKSPACE"
+
+      - name: Zip it
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          rm -f Integrity_Tools.zip
+          zip -rqX Integrity_Tools.zip Integrity_Tools
+          echo "built Integrity_Tools.zip ($(du -h Integrity_Tools.zip | cut -f1))"
+          unzip -l Integrity_Tools.zip | tail -n +4 | head -n 40
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Integrity_Tools
+          path: Integrity_Tools.zip
+          if-no-files-found: error
+
+      - name: Publish release (optional)
+        if: ${{ inputs.make_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release delete integrity-tools-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create integrity-tools-latest Integrity_Tools.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Integrity Tools (latest)" \
+            --notes "Newest build of Duck-ToolBox, OMK, PlayIntegrityFork, TEESimulator-RS, HMA-OSS + Keybox Autopilot. Auto-bundled by @Dev_DcS workflow."

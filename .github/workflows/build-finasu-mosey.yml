@@ -1,4 +1,4 @@
-name: Build FinaSU for Pixel (WildKernels + SUSFS + Mosey + Integrity Helper)
+name: Build FinaSU for Pixel 10 (WildKernels + SUSFS + Mosey + Integrity)
 
 permissions:
   contents: write
@@ -39,12 +39,6 @@ on:
           - standalone-matrix
           - wildkernels-fork-pipeline
         default: standalone-matrix
-      root_variant:
-        description: "Root Implementation (this workflow is FinaSU-only)"
-        type: choice
-        options:
-          - FinaSU
-        default: FinaSU
       release_type:
         description: "Release Type"
         type: choice
@@ -71,18 +65,15 @@ on:
         description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
         type: boolean
         default: true
-      ship_nomount:
-        description: "Also fetch + attach the NoMount module (maxsteeel/nomount, latest) so its version matches the kernel - avoids the NoMount driver/module mismatch"
-        type: boolean
-        default: false
-      enable_bbg:
-        description: "Enable Baseband Guard (BBG) LSM Partition Protection"
-        type: boolean
-        default: true
-      nv_write_guard:
-        description: "NV write guard: block writes to the modem's irreplaceable nv_protected.bin (RF-cal/IMEI). OFF by default - see README before enabling."
-        type: boolean
-        default: false
+      security_guards:
+        description: "Partition guards: 'bbg' (default) = Baseband-Guard only; 'bbg+nv' also blocks writes to the modem's irreplaceable nv_protected.bin (RF-cal/IMEI); 'nv' = NV guard only; 'none' = neither. See README before using NV."
+        type: choice
+        options:
+          - bbg
+          - bbg+nv
+          - nv
+          - none
+        default: bbg
       security_patches:
         description: "Security patch level: monthly = latest tagged GKI/LTS (Google monthly, tested); latest-cve = also apply post-release stable CVE fixes on top (bleeding edge, may skip on conflict - READ THE README WARNING); none = base as pinned"
         type: choice
@@ -91,16 +82,17 @@ on:
           - latest-cve
           - none
         default: monthly
-      enable_networking:
-        description: "Enable Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB)"
-        type: boolean
-        default: true
+      net_features:
+        description: "Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB) + NTSync (/dev/ntsync). 'both' (default), 'networking' or 'ntsync' for one, 'none' for neither."
+        type: choice
+        options:
+          - both
+          - networking
+          - ntsync
+          - none
+        default: both
       enable_bpf:
         description: "Enable Extended BPF (BTF, eBPF, FUSE-BPF)"
-        type: boolean
-        default: true
-      enable_ntsync:
-        description: "Enable NTSync (/dev/ntsync Windows NT synchronization primitive driver)"
         type: boolean
         default: true
       enable_droidspaces:
@@ -131,6 +123,23 @@ on:
         type: boolean
         default: true
 
+      # --- Integrity / extra kernel features (@Dev_DcS) ---
+      integrity_bundle:
+        description: "Also fetch the newest integrity tools (Duck-ToolBox, OMK, PlayIntegrityFork, TEESimulator-RS, HMA-OSS) + Keybox Autopilot and attach Integrity_Tools.zip. See integrity/INSTALL_ORDER.md for the Strong/Certified/locked-bootloader combo."
+        type: boolean
+        default: false
+      zram_algo:
+        description: "ZRAM default compressor: lz4 (fastest, default) or zstd (higher ratio, more effective RAM)"
+        type: choice
+        options:
+          - lz4
+          - zstd
+        default: lz4
+      enable_rekernel:
+        description: "Build Re-Kernel as an out-of-tree .ko (binder/signal netlink events). EXPERIMENTAL, OFF by default; needs a userspace consumer to do anything. Never affects the kernel image."
+        type: boolean
+        default: false
+
 jobs:
   # ============================================================================
   # JOB 1: Generate Multi-Version Build Matrix (5.10 -> 6.12 + Root Variants)
@@ -155,7 +164,7 @@ jobs:
 
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
-          req_root = "${{ inputs.root_variant }}"
+          req_root = "FinaSU"
 
           all_families = [
               {
@@ -375,18 +384,36 @@ jobs:
         shell: bash
         run: |
           cd kernel_workspace
-          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git wild_patches
-          git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
-            git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://github.com/ShirkNeko/susfs4ksu.git susfs4ksu || true
-          # FinaSU pins SUSFS to a specific commit (its hook model differs from the
-          # branch tip; HEAD panics in early boot). Pin it - see FinaSU builtin docs.
-          SUSFS_PIN="4a4cb1be85a4694372d3efb9420de69982eac29a"
-          if [ -d susfs4ksu/.git ]; then
-            git -C susfs4ksu fetch --unshallow 2>/dev/null || git -C susfs4ksu fetch --depth=100 origin "${{ matrix.susfs_branch }}" 2>/dev/null || true
-            if git -C susfs4ksu checkout -q "$SUSFS_PIN" 2>/dev/null; then
-              echo "[+] SUSFS pinned to FinaSU-compatible commit ${SUSFS_PIN:0:10}"
-            else
-              echo "::warning::could not pin SUSFS to $SUSFS_PIN - FinaSU may not boot with branch-tip SUSFS"
+          # Prefer vendored WildKernels patches (sources/wild_patches = common/ +
+          # gki_ptrace.patch, the subset this build applies). Clone only as fallback.
+          V_WILD="$GITHUB_WORKSPACE/sources/wild_patches"
+          if [ -d "$V_WILD" ]; then
+            echo "[+] Using vendored wild_patches from repo"
+            mkdir -p wild_patches && cp -a "$V_WILD/." wild_patches/
+          else
+            git clone --depth=1 https://github.com/WildKernels/kernel_patches.git wild_patches
+          fi
+          # Prefer the vendored susfs that ships in the repo (sources/susfs4ksu):
+          # it is already checked out at the FinaSU-pinned commit, so no clone and
+          # no git-checkout are needed and the build is reproducible / outage-proof.
+          # Fall back to cloning + pinning upstream only if it is not vendored.
+          V_SUSFS="$GITHUB_WORKSPACE/sources/susfs4ksu"
+          if [ -d "$V_SUSFS/kernel_patches" ]; then
+            echo "[+] Using vendored susfs4ksu from repo (already pinned to the FinaSU commit)"
+            rm -rf susfs4ksu && cp -a "$V_SUSFS" susfs4ksu
+          else
+            git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
+              git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://github.com/ShirkNeko/susfs4ksu.git susfs4ksu || true
+            # FinaSU pins SUSFS to a specific commit (its hook model differs from the
+            # branch tip; HEAD panics in early boot). Pin it - see FinaSU builtin docs.
+            SUSFS_PIN="4a4cb1be85a4694372d3efb9420de69982eac29a"
+            if [ -d susfs4ksu/.git ]; then
+              git -C susfs4ksu fetch --unshallow 2>/dev/null || git -C susfs4ksu fetch --depth=100 origin "${{ matrix.susfs_branch }}" 2>/dev/null || true
+              if git -C susfs4ksu checkout -q "$SUSFS_PIN" 2>/dev/null; then
+                echo "[+] SUSFS pinned to FinaSU-compatible commit ${SUSFS_PIN:0:10}"
+              else
+                echo "::warning::could not pin SUSFS to $SUSFS_PIN - FinaSU may not boot with branch-tip SUSFS"
+              fi
             fi
           fi
           git clone --depth=1 https://github.com/thelok1s/mosey-extended.git mosey_extended
@@ -440,7 +467,19 @@ jobs:
 
           echo "[+] Cloning ${ROOT_DIR} from ${ROOT_REPO}..."
           rm -rf "$ROOT_DIR"
-          if [ -n "$ROOT_BRANCH" ]; then
+          # FinaSU is cloned from upstream, pinned to the commit that boots. It can't
+          # be a plain vendored folder: kernel/include/uapi is a symlink into the
+          # repo-root uapi/, and Kbuild derives KSU_VERSION from git history - so it
+          # has to be a real, full-depth checkout or the manager sees a bogus version.
+          FINASU_PIN="2d5786b9129a254a87ac358c8bec0203ccd53351"
+          if [ "${{ matrix.root_variant }}" = "FinaSU" ]; then
+            git clone "$ROOT_REPO" "$ROOT_DIR"
+            if git -C "$ROOT_DIR" checkout -q "$FINASU_PIN" 2>/dev/null; then
+              echo "[+] FinaSU pinned to ${FINASU_PIN:0:10}"
+            else
+              echo "::warning::could not pin FinaSU to ${FINASU_PIN:0:10}; building default branch tip"
+            fi
+          elif [ -n "$ROOT_BRANCH" ]; then
             git clone --depth=1 -b "$ROOT_BRANCH" "$ROOT_REPO" "$ROOT_DIR" || git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
           else
             git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
@@ -564,9 +603,21 @@ jobs:
           find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
 
           # 2. Baseband Guard (BBG)
-          if [ "${{ inputs.enable_bbg }}" = "true" ]; then
+          if [ "${{ (inputs.security_guards == 'bbg' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}" = "true" ]; then
             echo "[+] Integrating Baseband Guard (BBG)..."
-            curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+            # Prefer the vendored Baseband-guard (sources/baseband-guard, pinned).
+            # A throwaway 'git init' (no remote) makes BBG's own setup.sh take its
+            # no-clone / no-fetch path, so it wires the tree from the vendored files
+            # without pulling upstream. Fall back to the upstream setup.sh otherwise.
+            BV="$GITHUB_WORKSPACE/sources/baseband-guard"
+            if [ -d "$BV" ]; then
+              echo "[+] Using vendored Baseband-guard from repo (pinned)"
+              rm -rf Baseband-guard && cp -a "$BV" Baseband-guard
+              git -C Baseband-guard init -q 2>/dev/null || true
+              bash Baseband-guard/setup.sh || true
+            else
+              curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+            fi
             find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
             # BBG's own Makefile bails ("BBG not enable in CONFIG_LSM") unless
             # 'baseband_guard' is in CONFIG_LSM. setup.sh drops the source in but
@@ -590,7 +641,7 @@ jobs:
           # or stray write - the classic way a Shannon efs ends up bricked.
           # nv_normal.bin is left writable on purpose so the modem can still
           # heal itself. Ships as a tiny LSM; only bites once it is in CONFIG_LSM.
-          if [ "${{ inputs.nv_write_guard }}" = "true" ]; then
+          if [ "${{ (inputs.security_guards == 'nv' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}" = "true" ]; then
             echo "[+] Integrating NV write guard (nv_guard LSM)..."
             NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
             # Copy the sources in rather than applying a context patch: the
@@ -678,7 +729,7 @@ jobs:
           # matched the compat patch (ntsync_base has no version in its name),
           # so CONFIG_NTSYNC=y referenced a drivers/misc/ntsync.o whose source
           # was never created -> "No rule to make target drivers/misc/ntsync.o".
-          if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ]; then
             echo "[+] Applying NTSync for ${{ matrix.kernel_version }}..."
             NT="$PATCH_DIR/common/ntsync"
             # 6.12 already carries ntsync.c/.h; drop them so base re-adds a known copy
@@ -695,7 +746,7 @@ jobs:
           fi
 
           # 4. Networking (BBRv3 / Netfilter for matching kernel series)
-          if [ "${{ inputs.enable_networking }}" = "true" ]; then
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
             echo "[+] Applying Networking patches for ${KVER_SHORT}..."
             find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
           fi
@@ -1194,6 +1245,23 @@ jobs:
 
           # Disable CONFIG_WERROR so unused-variable warnings in patched files never fail the build
           set_kconfig CONFIG_WERROR n
+          # ZRAM default compressor (@Dev_DcS). lz4 is the fastest and the
+          # default; zstd trades a little CPU for a notably higher ratio (more
+          # effective RAM). Both are in the GKI crypto set - we just enable the
+          # backend and point ZRAM's default at it. Runtime can still override.
+          case "${{ inputs.zram_algo }}" in
+            zstd)
+              set_kconfig CONFIG_CRYPTO_ZSTD y
+              set_kconfig CONFIG_ZRAM_DEF_COMP_ZSTD y
+              set_kconfig CONFIG_ZRAM_DEF_COMP "\"zstd\""
+              echo "[+] ZRAM default compressor: zstd"
+              ;;
+            *)
+              set_kconfig CONFIG_CRYPTO_LZ4 y
+              set_kconfig CONFIG_ZRAM_DEF_COMP_LZ4 y
+              echo "[+] ZRAM default compressor: lz4 (default)"
+              ;;
+          esac
           echo "KBUILD_CFLAGS += -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-unused-label -Wno-unused-but-set-variable" >> Makefile
 
           if [ "${{ matrix.root_variant }}" != "NoRoot" ]; then
@@ -1235,7 +1303,7 @@ jobs:
             set_kconfig CONFIG_TMPFS_POSIX_ACL y
           fi
 
-          if [ "${{ inputs.enable_networking }}" = "true" ]; then
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
             set_kconfig CONFIG_WIREGUARD y
             set_kconfig CONFIG_TCP_CONG_ADVANCED y
             set_kconfig CONFIG_TCP_CONG_BBR y
@@ -1256,7 +1324,7 @@ jobs:
 
           # only enable NTSync if its source actually made it into the tree,
           # else built-in.a references a drivers/misc/ntsync.o with no source
-          if [ "${{ inputs.enable_ntsync }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
             set_kconfig CONFIG_NTSYNC y
           fi
 
@@ -1280,7 +1348,7 @@ jobs:
           done
 
 
-      - name: Compile Kernel (${{ matrix.kernel_version }} — Auto Bazel / build.sh Dispatch)
+      - name: Compile Kernel (${{ matrix.kernel_version }} - Auto Bazel / build.sh Dispatch)
         shell: bash
         run: |
           cd kernel_workspace
@@ -1535,10 +1603,10 @@ jobs:
           SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
           Root Implementation: ${{ matrix.root_variant }}
           NoMount / TMPFS ACL: ${{ inputs.enable_nomount }}
-          Baseband Guard (BBG): ${{ inputs.enable_bbg }}
-          Networking Suite: ${{ inputs.enable_networking }}
+          Baseband Guard (BBG): ${{ (inputs.security_guards == 'bbg' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}
+          Networking Suite: ${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}
           Extended BPF/BTF: ${{ inputs.enable_bpf }}
-          NTSync (/dev/ntsync): ${{ inputs.enable_ntsync }}
+          NTSync (/dev/ntsync): ${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}
           DroidSpaces-OSS: ${{ inputs.enable_droidspaces }}
           Mosey Extended Mode: ${{ inputs.mosey_mode }} (MAC: ${{ inputs.mosey_mac_addr }})
           NLMON Capture: ${{ inputs.enable_nlmon }}
@@ -1595,7 +1663,7 @@ jobs:
           path: managers/*.apk
 
       - name: Fetch NoMount module
-        if: ${{ inputs.ship_nomount == true }}
+        if: ${{ true }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1609,8 +1677,83 @@ jobs:
           fi
 
       - name: Upload NoMount module
-        if: ${{ inputs.ship_nomount == true && hashFiles('nomount_out/*') != '' }}
+        if: ${{ hashFiles('nomount_out/*') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-NoMount"
           path: nomount_out/*
+
+      - name: Build Re-Kernel module (out-of-tree, experimental, @Dev_DcS)
+        if: ${{ inputs.enable_rekernel == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd kernel_workspace
+          REK_SRC="$GITHUB_WORKSPACE/sources/rekernel/LKM-Source"
+          LOADER="$GITHUB_WORKSPACE/sources/rekernel/loader"
+          if [ ! -f "$REK_SRC/Makefile" ]; then echo "::warning::Re-Kernel: vendored source missing, skipping (kernel zip unaffected)"; exit 0; fi
+          OBJ="$RUNNER_TEMP/rek_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
+          REK="$GITHUB_WORKSPACE/rekernel_build"; rm -rf "$REK"; mkdir -p "$REK"; cp -a "$REK_SRC/." "$REK/"
+          cfg=""; for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do [ -f "$c" ] && cfg="$c" && break; done
+          [ -n "$cfg" ] || cfg="$(find . -maxdepth 5 -type f -name .config 2>/dev/null | head -n1 || true)"
+          img=""; for i in out/dist/Image bazel-bin/common/kernel_aarch64/Image; do [ -f "$i" ] && img="$i" && break; done
+          [ -n "$img" ] || img="$(find . -maxdepth 5 -type f -name Image 2>/dev/null | head -n1 || true)"
+          if [ -z "$cfg" ] || [ -z "$img" ]; then echo "::warning::Re-Kernel: no .config/Image, skipping (kernel zip unaffected)"; exit 0; fi
+          krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"; [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
+          clang_ver="$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null | head -n1 || true)"
+          clang_bin="$(sed -n 's/^CLANG_PREBUILT_BIN=//p' common/build.config.common 2>/dev/null | head -n1 || true)"
+          clang_bin="${clang_bin//\$\{CLANG_VERSION\}/$clang_ver}"
+          [ -x "$clang_bin/clang" ] || clang_bin="prebuilts/clang/host/linux-x86/clang-${clang_ver}/bin"
+          [ -x "$clang_bin/clang" ] || clang_bin="$(find prebuilts*/clang/host/linux-x86 -maxdepth 2 -path '*/clang-r*/bin' -type d 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$clang_bin" ] || [ ! -x "$clang_bin/clang" ]; then echo "::warning::Re-Kernel: no prebuilt clang, skipping"; exit 0; fi
+          export PATH="$PWD/$clang_bin:$PATH"
+          cp "$cfg" "$OBJ/.config"
+          [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
+          mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)")
+          "${mk[@]}" olddefconfig || { echo "::warning::Re-Kernel: olddefconfig failed, skipping"; exit 0; }
+          "${mk[@]}" modules_prepare || { echo "::warning::Re-Kernel: modules_prepare failed, skipping"; exit 0; }
+          echo "$krel" > "$OBJ/include/config/kernel.release"
+          printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
+          sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
+          [ -n "$sv" ] && cp "$sv" "$OBJ/Module.symvers" || echo "::warning::Re-Kernel: no symvers, core symbols unversioned"
+          if ! "${mk[@]}" M="$REK" KBUILD_MODPOST_WARN=1 modules; then echo "::warning::Re-Kernel: module build failed (vendor-hook mismatch on this KMI?); skipping, kernel zip unaffected"; exit 0; fi
+          ko="$(find "$REK" -name 'rekernel*.ko' -type f | head -n1 || true)"
+          [ -n "$ko" ] || { echo "::warning::Re-Kernel: no .ko produced, skipping"; exit 0; }
+          llvm-strip --strip-debug "$ko" 2>/dev/null || true
+          echo "[+] built $(basename "$ko")  vermagic: $(modinfo -F vermagic "$ko" 2>/dev/null || echo '?')"
+          PKG="$GITHUB_WORKSPACE/rekernel_pkg"; rm -rf "$PKG"; mkdir -p "$PKG"
+          cp -a "$LOADER/." "$PKG/"
+          cp "$ko" "$PKG/rekernel-${krel}.ko"
+          sed -i "s|@KREL@|${krel}|g; s|@VC@|$(date +%Y%m%d)|g" "$PKG/module.prop.in"
+          mv "$PKG/module.prop.in" "$PKG/module.prop"
+          ZIP="$GITHUB_WORKSPACE/Re-Kernel-${krel}-DevDcS.zip"
+          (cd "$PKG" && zip -rqX "$ZIP" .)
+          echo "[+] packaged $(basename "$ZIP")"
+
+      - name: Upload Re-Kernel module
+        if: ${{ inputs.enable_rekernel == 'true' && hashFiles('Re-Kernel-*-DevDcS.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-Re-Kernel"
+          path: Re-Kernel-*-DevDcS.zip
+
+      - name: Fetch & bundle Integrity Tools (Integrity_Tools.zip)
+        if: ${{ inputs.integrity_bundle == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          chmod +x scripts/fetch_integrity_tools.sh 2>/dev/null || true
+          if ! bash scripts/fetch_integrity_tools.sh "$GITHUB_WORKSPACE/Integrity_Tools" "$GITHUB_WORKSPACE"; then
+            echo "::warning::Integrity tools fetch failed (kernel zip unaffected)"; exit 0
+          fi
+          cd "$GITHUB_WORKSPACE"
+          rm -f Integrity_Tools.zip
+          zip -rqX Integrity_Tools.zip Integrity_Tools || true
+
+      - name: Upload Integrity_Tools.zip
+        if: ${{ inputs.integrity_bundle == 'true' && hashFiles('Integrity_Tools.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Integrity_Tools
+          path: Integrity_Tools.zip

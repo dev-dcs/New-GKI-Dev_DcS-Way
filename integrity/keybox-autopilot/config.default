@@ -1,0 +1,24 @@
+# Keybox Autopilot config. Edit here or from the WebUI. @Dev_DcS
+#
+# Where to pull keybox.xml from. LEAVE EMPTY until you have a source you trust.
+# A keybox is a set of attestation keys + certs. A valid, non-revoked HARDWARE
+# keybox is what STRONG integrity needs - you can't mint one and leaked ones get
+# revoked fast, so Autopilot will REFUSE to install a revoked keybox. Point this
+# at a raw keybox.xml URL (or a small JSON/redirect that resolves to one).
+SOURCE_URL=""
+
+# How often to re-check the source, in hours (0 = only on boot / manual).
+REFRESH_HOURS=12
+
+# Apply the built-in recommended target set (Play Store, Play Services, Wallet,
+# GPay). Your own packages in targets.custom are always applied on top.
+APPLY_RECOMMENDED=1
+
+# Verify the keybox against Google's attestation status list before installing,
+# and refuse it if any cert in the chain is revoked. Keep this on.
+CHECK_REVOCATION=1
+
+# Where to install. TrickyStore is the default backend; TEESimulator shares the
+# same path. Leave as-is unless you know you need another location.
+KEYBOX_DEST="/data/adb/tricky_store/keybox.xml"
+TARGET_DEST="/data/adb/tricky_store/target.txt"

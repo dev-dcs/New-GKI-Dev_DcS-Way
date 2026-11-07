@@ -1,0 +1,144 @@
+name: Supplements only (no kernel)
+
+# Grabs everything that ships next to the kernel, without building the kernel:
+# FinaSU manager APK, NoMount module, and the integrity bundle (Duck-ToolBox,
+# OMK, PlayIntegrityFork, TEESimulator-RS, HMA-OSS + Keybox Autopilot).
+#
+# Not in here on purpose: the Mosey enabler and Re-Kernel. Both carry a .ko
+# that has to be built against the exact kernel it loads into, so they only
+# come out of the kernel build.
+# @Dev_DcS
+
+on:
+  workflow_dispatch:
+    inputs:
+      manager_tag:
+        description: "FinaSU manager release tag to fetch (blank = latest). Pin it to match an older kernel build."
+        type: string
+        default: ""
+      nomount_tag:
+        description: "NoMount release tag to fetch (blank = latest). Should match the NoMount driver in the kernel you're running."
+        type: string
+        default: ""
+      include_integrity:
+        description: "Also fetch the integrity tools bundle (+ Keybox Autopilot)"
+        type: boolean
+        default: true
+      make_release:
+        description: "Also publish everything as a GitHub Release (tag: supplements-latest)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  supplements:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout (for Keybox Autopilot + fetch script)
+        uses: actions/checkout@v4
+
+      - name: Prepare output folder
+        shell: bash
+        run: |
+          OUT="$GITHUB_WORKSPACE/Supplements"
+          rm -rf "$OUT"; mkdir -p "$OUT/Manager" "$OUT/NoMount"
+          printf 'Supplements - pulled %s UTC\n' "$(date -u '+%Y-%m-%d %H:%M')" > "$OUT/MANIFEST.txt"
+          echo "----------------------------------------------------------------" >> "$OUT/MANIFEST.txt"
+
+      - name: Fetch FinaSU manager APK
+        shell: bash
+        run: |
+          OUT="$GITHUB_WORKSPACE/Supplements"
+          REPO="LyraVoid/FinaSU"
+          TAG="${{ inputs.manager_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || true)"
+          fi
+          if [ -n "$TAG" ] && gh release download "$TAG" --repo "$REPO" --pattern '*.apk' --dir "$OUT/Manager" 2>/dev/null; then
+            for f in "$OUT"/Manager/*.apk; do
+              echo "Manager   $REPO  $TAG  $(basename "$f")  sha256:$(sha256sum "$f" | cut -d' ' -f1)" >> "$OUT/MANIFEST.txt"
+            done
+            echo "[+] manager: $(ls "$OUT/Manager" | tr '\n' ' ')"
+          else
+            echo "::warning::no manager APK for '${TAG:-latest}' in $REPO"
+            echo "Manager   $REPO  ${TAG:-latest}  (not found)" >> "$OUT/MANIFEST.txt"
+          fi
+
+      - name: Fetch NoMount module
+        shell: bash
+        run: |
+          OUT="$GITHUB_WORKSPACE/Supplements"
+          REPO="maxsteeel/nomount"
+          TAG="${{ inputs.nomount_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || true)"
+          fi
+          if [ -n "$TAG" ] && gh release download "$TAG" --repo "$REPO" --pattern '*.zip' --dir "$OUT/NoMount" 2>/dev/null; then
+            for f in "$OUT"/NoMount/*.zip; do
+              echo "NoMount   $REPO  $TAG  $(basename "$f")  sha256:$(sha256sum "$f" | cut -d' ' -f1)" >> "$OUT/MANIFEST.txt"
+            done
+            echo "[+] nomount: $(ls "$OUT/NoMount" | tr '\n' ' ')"
+          else
+            echo "::warning::no NoMount zip for '${TAG:-latest}' in $REPO"
+            echo "NoMount   $REPO  ${TAG:-latest}  (not found)" >> "$OUT/MANIFEST.txt"
+          fi
+
+      - name: Fetch integrity tools bundle
+        if: ${{ inputs.include_integrity }}
+        shell: bash
+        run: |
+          OUT="$GITHUB_WORKSPACE/Supplements"
+          chmod +x scripts/fetch_integrity_tools.sh 2>/dev/null || true
+          if bash scripts/fetch_integrity_tools.sh "$OUT/Integrity_Tools" "$GITHUB_WORKSPACE"; then
+            echo "" >> "$OUT/MANIFEST.txt"
+            cat "$OUT/Integrity_Tools/MANIFEST.txt" >> "$OUT/MANIFEST.txt"
+          else
+            echo "::warning::integrity tools fetch failed - manager/NoMount still ship"
+          fi
+
+      - name: Zip it all
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          rm -f Supplements.zip
+          zip -rqX Supplements.zip Supplements
+          echo "built Supplements.zip ($(du -h Supplements.zip | cut -f1))"
+          echo "----- MANIFEST -----"; cat Supplements/MANIFEST.txt
+
+      - name: Upload Supplements.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Supplements
+          path: Supplements.zip
+          if-no-files-found: error
+
+      - name: Upload Manager APK
+        if: ${{ hashFiles('Supplements/Manager/*.apk') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinaSU-Manager
+          path: Supplements/Manager/*.apk
+
+      - name: Upload NoMount module
+        if: ${{ hashFiles('Supplements/NoMount/*.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: NoMount
+          path: Supplements/NoMount/*.zip
+
+      - name: Publish release (optional)
+        if: ${{ inputs.make_release }}
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          shopt -s nullglob
+          assets=(Supplements.zip Supplements/Manager/*.apk Supplements/NoMount/*.zip)
+          gh release delete supplements-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create supplements-latest "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Supplements (latest)" \
+            --notes-file Supplements/MANIFEST.txt
