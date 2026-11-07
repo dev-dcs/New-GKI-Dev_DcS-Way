@@ -467,12 +467,18 @@ jobs:
 
           echo "[+] Cloning ${ROOT_DIR} from ${ROOT_REPO}..."
           rm -rf "$ROOT_DIR"
-          # Prefer the vendored FinaSU tree (sources/finasu, pinned to the commit
-          # that currently boots). Clone upstream only if it is not vendored.
-          V_FINASU="$GITHUB_WORKSPACE/sources/finasu"
-          if [ "${{ matrix.root_variant }}" = "FinaSU" ] && [ -d "$V_FINASU/kernel" ]; then
-            echo "[+] Using vendored FinaSU from repo (sources/finasu, pinned)"
-            rm -rf "$ROOT_DIR" && cp -a "$V_FINASU" "$ROOT_DIR"
+          # FinaSU is cloned from upstream, pinned to the commit that boots. It can't
+          # be a plain vendored folder: kernel/include/uapi is a symlink into the
+          # repo-root uapi/, and Kbuild derives KSU_VERSION from git history - so it
+          # has to be a real, full-depth checkout or the manager sees a bogus version.
+          FINASU_PIN="2d5786b9129a254a87ac358c8bec0203ccd53351"
+          if [ "${{ matrix.root_variant }}" = "FinaSU" ]; then
+            git clone "$ROOT_REPO" "$ROOT_DIR"
+            if git -C "$ROOT_DIR" checkout -q "$FINASU_PIN" 2>/dev/null; then
+              echo "[+] FinaSU pinned to ${FINASU_PIN:0:10}"
+            else
+              echo "::warning::could not pin FinaSU to ${FINASU_PIN:0:10}; building default branch tip"
+            fi
           elif [ -n "$ROOT_BRANCH" ]; then
             git clone --depth=1 -b "$ROOT_BRANCH" "$ROOT_REPO" "$ROOT_DIR" || git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
           else
