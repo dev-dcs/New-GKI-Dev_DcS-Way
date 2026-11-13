@@ -1,0 +1,1934 @@
+name: Build FolkPatch for Pixel 10 (stock GKI + KernelPatch/APatch + SUSFS-KPM + Mosey + Integrity)
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      # --- Core Kernel & Matrix Selection (All WildKernels Families) ---
+      kernel_build_version:
+        description: "Kernel Version Family (select 'all' to build 6.1 / 6.6 / 6.12 in parallel)"
+        type: choice
+        options:
+          - android15-6.6
+          - android14-6.1
+          - android16-6.12
+          - all
+        default: android15-6.6
+      gki_lts_version:
+        description: "Specific LTS Subversion - pinned to 6.6.144 for Pixel 10 (mustang); change only if your device moved to a newer 6.6 LTS"
+        type: string
+        default: "6.6.144"
+      kernel_name:
+        description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
+        type: string
+        default: ""
+      page_size:
+        description: "ARM64 page size - keep 4k unless your Pixel 10 runs 16KB pages (check: getconf PAGE_SIZE). Wrong value won't boot."
+        type: choice
+        options:
+          - 4k
+          - 16k
+        default: 4k
+      build_variant:
+        description: "Pipeline Mode (standalone multi-version matrix or hook into WildKernels fork actions)"
+        type: choice
+        options:
+          - standalone-matrix
+          - wildkernels-fork-pipeline
+        default: standalone-matrix
+      release_type:
+        description: "Release Type"
+        type: choice
+        options:
+          - CI
+          - Pre-Release
+          - Release
+        default: CI
+      use_cache:
+        description: "Use ccache (5.10/5.15) & Bazel cache (5.15+/6.x) (restore/save)"
+        type: boolean
+        default: true
+      allow_version_mismatch:
+        description: "Module Check Bypass (force check_version() to pass on mismatched module CRCs)"
+        type: boolean
+        default: false
+
+      # --- Regular WildKernels Feature Set Toggles ---
+      enable_susfs:
+        description: "Lay down the SUSFS fs-side sources (susfs4ksu 50_add). On a stock FolkPatch kernel these stay INERT - CONFIG_KSU_SUSFS has no Kconfig without a KSU driver, so fs/susfs.c isn't compiled - but the implementation is present in-tree for a future SUSFS KPM / the FolkPatch app to drive. Live mount hiding today comes from NoMount. Leave ON to ship the sources; OFF to build fully clean."
+        type: boolean
+        default: true
+      enable_nomount:
+        description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
+        type: boolean
+        default: true
+      security_guards:
+        description: "Partition guards: 'bbg' (default) = Baseband-Guard only; 'bbg+nv' also blocks writes to the modem's irreplaceable nv_protected.bin (RF-cal/IMEI); 'nv' = NV guard only; 'none' = neither. See README before using NV."
+        type: choice
+        options:
+          - bbg
+          - bbg+nv
+          - nv
+          - none
+        default: bbg
+      security_patches:
+        description: "Security patch level: monthly = latest tagged GKI/LTS (Google monthly, tested); latest-cve = also apply post-release stable CVE fixes on top (bleeding edge, may skip on conflict - READ THE README WARNING); none = base as pinned"
+        type: choice
+        options:
+          - monthly
+          - latest-cve
+          - none
+        default: monthly
+      net_features:
+        description: "Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB) + NTSync (/dev/ntsync). 'both' (default), 'networking' or 'ntsync' for one, 'none' for neither."
+        type: choice
+        options:
+          - both
+          - networking
+          - ntsync
+          - none
+        default: both
+      enable_bpf:
+        description: "Enable Extended BPF (BTF, eBPF, FUSE-BPF)"
+        type: boolean
+        default: true
+      enable_droidspaces:
+        description: "Enable DroidSpaces-OSS Container Runtime Configs & Patches"
+        type: boolean
+        default: true
+      enable_performance:
+        description: "Enable WildKernels Performance Tuning & Compression Patches (LZ4/ZSTD)"
+        type: boolean
+        default: true
+
+      # --- Mosey Extended (AirDrop / Quick Share) Options ---
+      mosey_mode:
+        description: "Mosey Extended (wonder_mosey_wild) Driver Integration Mode"
+        type: choice
+        options:
+          - builtin
+          - module
+          - both
+          - disabled
+        default: both
+      mosey_mac_addr:
+        description: "Default Locally-Administered MAC for Mosey wonder0 (NL80211 vendor subcmd 5)"
+        type: string
+        default: "6a:b0:5d:c7:27:3d"
+      enable_nlmon:
+        description: "Enable CONFIG_NLMON=y (nlmon0 netlink pcap capture for Mosey debugging)"
+        type: boolean
+        default: true
+
+      # --- Integrity / extra kernel features (@Dev_DcS) ---
+      integrity_bundle:
+        description: "Also fetch the newest integrity tools (Duck-ToolBox, OMK, PlayIntegrityFork, TEESimulator-RS, HMA-OSS) + Keybox Autopilot and attach Integrity_Tools.zip. See integrity/INSTALL_ORDER.md for the Strong/Certified/locked-bootloader combo."
+        type: boolean
+        default: false
+      zram_algo:
+        description: "ZRAM default compressor: lz4 (fastest, default) or zstd (higher ratio, more effective RAM)"
+        type: choice
+        options:
+          - lz4
+          - zstd
+        default: lz4
+      enable_rekernel:
+        description: "Build Re-Kernel as an out-of-tree .ko (binder/signal netlink events). EXPERIMENTAL, OFF by default; needs a userspace consumer to do anything. Never affects the kernel image."
+        type: boolean
+        default: false
+
+      # --- FolkPatch / KernelPatch (APatch) root (@Dev_DcS) ---
+      superkey:
+        description: "KernelPatch SuperKey for the CI-prepatched image. Blank = a random 16-hex key, printed in the log and FolkPatch-prepatched.txt. ROOT-EQUIVALENT - keep it private."
+        type: string
+        default: ""
+      ci_prepatch:
+        description: "Also build a CI-prepatched kernel: KernelPatch (kpimg) + superkey baked into the Image, with NoMount, your chosen slot-#2 hide KPM (see hide_kpm) and selinux_magisk_access_filter embedded, as a second AnyKernel3 zip (userspace companion zips attached separately; any .kpm in sources/kpms/ is embedded verbatim). EXPERIMENTAL (kpimg/KPM ABI unverified); the stock zip stays the primary output."
+        type: boolean
+        default: false
+      hide_kpm:
+        description: "Slot #2 KPM baked into the CI-prepatched image (BreZygisk-safe, NOT NoHello): 'xechide' (byBOOK10086/XEChide - kernel app hiding, LSM path + binder filtering, no userspace injection) or 'hide_env' (klcok/kpm-hide-env - root-environment hiding). 'none' to skip. To pin an exact/closed .kpm, drop it in sources/kpms/ instead."
+        type: choice
+        options:
+          - xechide
+          - hide_env
+          - none
+        default: xechide
+
+jobs:
+  # ============================================================================
+  # JOB 1: Generate Multi-Version Build Matrix (5.10 -> 6.12 + Root Variants)
+  # ============================================================================
+  generate-matrix:
+    name: "Resolve Kernel & Root Matrix"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Build Dynamic Matrix JSON
+        id: set-matrix
+        shell: bash
+        run: |
+          python3 - << 'EOF'
+          import json
+          import os
+
+          req_family = "${{ inputs.kernel_build_version }}"
+          req_lts = "${{ inputs.gki_lts_version }}".strip()
+          req_root = "NoRoot"
+
+          all_families = [
+              {
+                  "kernel_version": "android14-6.1",
+                  "kver": "6.1",
+                  "manifest_branch": "common-android14-6.1-lts",
+                  "susfs_branch": "gki-android14-6.1",
+                  "cache_type": "bazel",
+                  "build_tool": "bazel",
+              },
+              {
+                  "kernel_version": "android15-6.6",
+                  "kver": "6.6",
+                  "manifest_branch": "common-android15-6.6-lts",
+                  "susfs_branch": "gki-android15-6.6",
+                  "cache_type": "bazel",
+                  "build_tool": "bazel",
+              },
+              {
+                  "kernel_version": "android16-6.12",
+                  "kver": "6.12",
+                  "manifest_branch": "common-android16-6.12-lts",
+                  "susfs_branch": "gki-android16-6.12",
+                  "cache_type": "bazel",
+                  "build_tool": "bazel",
+              },
+          ]
+
+          if req_family == "all":
+              selected_families = all_families
+          else:
+              selected_families = [f for f in all_families if f["kernel_version"] == req_family]
+
+          if req_root == "All":
+              roots = ["KernelSU-Next", "KernelSU", "BakaSU"]
+          else:
+              roots = [req_root]
+
+          include = []
+          for fam in selected_families:
+              lts_val = "lts"
+              if req_lts:
+                  if req_lts.startswith(fam["kver"] + "."):
+                      lts_val = req_lts
+                  elif req_family != "all":
+                      lts_val = req_lts
+              for r in roots:
+                  entry = dict(fam)
+                  entry["lts_version"] = lts_val
+                  entry["root_variant"] = r
+                  include.append(entry)
+
+          matrix_json = json.dumps({"include": include})
+          print("Generated matrix:", matrix_json)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={matrix_json}\n")
+          EOF
+
+  # ============================================================================
+  # JOB 2: WildKernels Fork Pipeline Mode (All Versions via .github/actions)
+  # ============================================================================
+  build-fork-pipeline:
+    name: "Fork Pipeline: ${{ matrix.kernel_version }} (${{ matrix.lts_version }})"
+    needs: generate-matrix
+    if: ${{ inputs.build_variant == 'wildkernels-fork-pipeline' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout WildKernels Repository
+        uses: actions/checkout@v4
+
+      - name: Inject Mosey Extended Driver Hook into .github/actions/build-kernel
+        if: ${{ inputs.mosey_mode != 'disabled' }}
+        shell: bash
+        run: |
+          mkdir -p .github/mosey
+          git clone --depth=1 https://github.com/thelok1s/mosey-extended.git /tmp/mosey_extended || true
+
+          if [ -f /tmp/mosey_extended/agy/ksu_wonder_module/mosey_wonder/wonder_mosey_wild.c ]; then
+            cp -f /tmp/mosey_extended/agy/ksu_wonder_module/mosey_wonder/wonder_mosey_wild.c .github/mosey/wonder_mosey_wild.c
+          elif [ -f /tmp/mosey_extended/system/vendor/bin/wonder/wonder_mosey_wild.c ]; then
+            cp -f /tmp/mosey_extended/system/vendor/bin/wonder/wonder_mosey_wild.c .github/mosey/wonder_mosey_wild.c
+          fi
+
+          cat << 'EOF' > .github/mosey/inject_mosey.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          KSRC_DIR="${1:-common}"
+          MOSEY_MODE="${2:-both}"
+          DEFAULT_MAC="${3:-6a:b0:5d:c7:27:3d}"
+          ENABLE_NLMON="${4:-true}"
+
+          if [ ! -d "$KSRC_DIR/drivers/net/wireless" ]; then
+            exit 0
+          fi
+
+          if [ -f "$GITHUB_WORKSPACE/.github/mosey/wonder_mosey_wild.c" ]; then
+            cp -f "$GITHUB_WORKSPACE/.github/mosey/wonder_mosey_wild.c" "$KSRC_DIR/drivers/net/wireless/wonder_mosey_wild.c"
+            sed -i "s/6a:b0:5d:c7:27:3d/${DEFAULT_MAC}/g" "$KSRC_DIR/drivers/net/wireless/wonder_mosey_wild.c"
+          fi
+
+          if ! grep -q "wonder_mosey_wild" "$KSRC_DIR/drivers/net/wireless/Makefile"; then
+            if [ "$MOSEY_MODE" = "module" ]; then
+              echo "obj-m += wonder_mosey_wild.o" >> "$KSRC_DIR/drivers/net/wireless/Makefile"
+            else
+              echo "obj-y += wonder_mosey_wild.o" >> "$KSRC_DIR/drivers/net/wireless/Makefile"
+            fi
+          fi
+
+          # cfg80211/mac80211 are NOT forced into the image on GKI (they are
+          # vendor modules); the wonder phy loads against the device's own
+          # cfg80211. Nothing to add to the defconfig here.
+          :
+          EOF
+          chmod +x .github/mosey/inject_mosey.sh
+
+          if [ -f .github/actions/build-kernel/action.yml ]; then
+            sed -i 's|tools/bazel|bash "$GITHUB_WORKSPACE/.github/mosey/inject_mosey.sh" common "${{ inputs.mosey_mode }}" "${{ inputs.mosey_mac_addr }}" "${{ inputs.enable_nlmon }}" \&\& tools/bazel|g' .github/actions/build-kernel/action.yml
+          fi
+
+      - name: Run WildKernels Build Action
+        if: hashFiles('.github/actions/build-kernel/action.yml') != ''
+        uses: ./.github/actions/build-kernel
+        with:
+          version: ${{ matrix.kernel_version }}
+          page_size: ${{ inputs.page_size }}
+          allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
+
+  # ============================================================================
+  # JOB 3: Standalone Multi-Version Builder (5.10, 5.15, 6.1, 6.6, 6.12 + Mosey)
+  # ============================================================================
+  build-all-versions-mosey:
+    name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | ${{ matrix.root_variant }} + Mosey)"
+    needs: generate-matrix
+    if: ${{ inputs.build_variant == 'standalone-matrix' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout WildKernels Fork Repository (for finasu_compat / bakasu_compat / susfs scripts)
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Maximize Runner Disk Space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Build Dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git git-lfs gnupg gperf \
+            libelf-dev libncurses5-dev libssl-dev libxml2-utils lz4 pahole \
+            python3 python3-pip rsync unzip wget xz-utils zip zstd \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          mkdir -p ~/bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Build Cache (${{ matrix.cache_type }})
+        if: ${{ inputs.use_cache }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/ccache
+          key: wildkernel-mosey-${{ matrix.kernel_version }}-${{ matrix.lts_version }}-${{ matrix.root_variant }}-${{ github.run_id }}
+          restore-keys: |
+            wildkernel-mosey-${{ matrix.kernel_version }}-${{ matrix.lts_version }}-${{ matrix.root_variant }}-
+            wildkernel-mosey-${{ matrix.kernel_version }}-
+
+      - name: Sync Google GKI Kernel Manifest (${{ matrix.manifest_branch }})
+        id: sync-kernel
+        shell: bash
+        run: |
+          mkdir -p kernel_workspace && cd kernel_workspace
+          repo init -u https://android.googlesource.com/kernel/manifest -b "${{ matrix.manifest_branch }}" --depth=1
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
+
+          cd common
+          VERSION=$(grep -E '^VERSION = ' Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep -E '^PATCHLEVEL = ' Makefile | awk '{print $3}')
+          CURRENT_SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          REQ_LTS="${{ matrix.lts_version }}"
+
+          if [ -n "$REQ_LTS" ] && [ "$REQ_LTS" != "lts" ]; then
+            TARGET_SUBLEVEL=$(echo "$REQ_LTS" | cut -d. -f3)
+            if [ -n "$TARGET_SUBLEVEL" ] && [ "$CURRENT_SUBLEVEL" != "$TARGET_SUBLEVEL" ]; then
+              git fetch --unshallow aosp || true
+              MATCH_COMMIT=$(git log --grep="Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}" -n 1 --format="%H" || true)
+              if [ -n "$MATCH_COMMIT" ]; then
+                echo "[+] Checking out exact commit for Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}: $MATCH_COMMIT"
+                git checkout "$MATCH_COMMIT"
+              else
+                echo "[!] Pinning SUBLEVEL=${TARGET_SUBLEVEL} in Makefile"
+                sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${TARGET_SUBLEVEL}/" Makefile
+              fi
+              CURRENT_SUBLEVEL="$TARGET_SUBLEVEL"
+            fi
+          fi
+
+          RESOLVED_KVER="${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
+          echo "resolved_kver=${RESOLVED_KVER}" >> "$GITHUB_OUTPUT"
+          echo "resolved_sublevel=${CURRENT_SUBLEVEL}" >> "$GITHUB_OUTPUT"
+          echo "[*] Building kernel version: ${RESOLVED_KVER} (${{ matrix.kernel_version }})"
+
+      - name: Fetch WildKernels Patches, SUSFS (${{ matrix.susfs_branch }}), and Mosey Extended
+        shell: bash
+        run: |
+          cd kernel_workspace
+          # Prefer vendored WildKernels patches (sources/wild_patches = common/ +
+          # gki_ptrace.patch, the subset this build applies). Clone only as fallback.
+          V_WILD="$GITHUB_WORKSPACE/sources/wild_patches"
+          if [ -d "$V_WILD" ]; then
+            echo "[+] Using vendored wild_patches from repo"
+            mkdir -p wild_patches && cp -a "$V_WILD/." wild_patches/
+          else
+            git clone --depth=1 https://github.com/WildKernels/kernel_patches.git wild_patches
+          fi
+          git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
+            git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://github.com/ShirkNeko/susfs4ksu.git susfs4ksu || true
+          git clone --depth=1 https://github.com/thelok1s/mosey-extended.git mosey_extended
+
+      - name: Integrate Root Implementation (${{ matrix.root_variant }})
+        if: ${{ matrix.root_variant != 'NoRoot' }}
+        shell: bash
+        run: |
+          cd kernel_workspace
+          DRIVERS_DIR="common/drivers"
+          rm -rf "$DRIVERS_DIR/kernelsu"
+
+          case "${{ matrix.root_variant }}" in
+            FinaSU)
+              ROOT_REPO="https://github.com/LyraVoid/FinaSU.git"
+              ROOT_DIR="FinaSU"
+              ROOT_BRANCH=""
+              ;;
+            BakaSU)
+              ROOT_REPO="https://github.com/Baka-SU/BakaSU.git"
+              ROOT_DIR="BakaSU"
+              ROOT_BRANCH=""
+              ;;
+            KernelSU-Next)
+              if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+                ROOT_REPO="https://github.com/pershoot/KernelSU-Next.git"
+                ROOT_DIR="KernelSU-Next"
+                ROOT_BRANCH="dev-susfs"
+              else
+                ROOT_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
+                ROOT_DIR="KernelSU-Next"
+                ROOT_BRANCH="next"
+              fi
+              ;;
+            KernelSU)
+              ROOT_REPO="https://github.com/tiann/KernelSU.git"
+              ROOT_DIR="KernelSU"
+              ROOT_BRANCH="main"
+              ;;
+            ReSukiSU)
+              ROOT_REPO="https://github.com/ReSukiSU/ReSukiSU.git"
+              ROOT_DIR="ReSukiSU"
+              ROOT_BRANCH="main"
+              ;;
+            KowSU)
+              ROOT_REPO="https://github.com/KOWX712/KernelSU.git"
+              ROOT_DIR="KowSU"
+              ROOT_BRANCH="master"
+              ;;
+          esac
+
+          echo "[+] Cloning ${ROOT_DIR} from ${ROOT_REPO}..."
+          rm -rf "$ROOT_DIR"
+          if [ -n "$ROOT_BRANCH" ]; then
+            git clone --depth=1 -b "$ROOT_BRANCH" "$ROOT_REPO" "$ROOT_DIR" || git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
+          else
+            git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
+          fi
+
+          if [ ! -d "$ROOT_DIR/kernel" ]; then
+            echo "[-] Error: $ROOT_DIR/kernel directory not found!"
+            exit 1
+          fi
+
+          REL_KERNEL="$(realpath --relative-to="$DRIVERS_DIR" "$PWD/$ROOT_DIR/kernel")"
+          ln -s "$REL_KERNEL" "$DRIVERS_DIR/kernelsu"
+          echo "[+] Linked $DRIVERS_DIR/kernelsu -> $REL_KERNEL"
+
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' "$DRIVERS_DIR/Makefile" || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$DRIVERS_DIR/Makefile"
+
+          if [ -f "$DRIVERS_DIR/Kconfig" ] && ! grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
+          fi
+
+          # FinaSU manager trust: bake the CURRENT FinaSU manager's signing cert
+          # as the auto-trusted slot. Without this, FinaSU's dynamic-manager
+          # default trusts only weishu's KernelSU app and the FinaSU manager
+          # shows "Not installed". We compute the signature from the actual
+          # latest manager APK so it tracks FinaSU updates (v1.4.4+), and fall
+          # back to the known v1.4.x cert if the fetch/compute can't run.
+          if [ "${{ matrix.root_variant }}" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
+            FINA_SZ="0x02cc"
+            FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
+            FMGR="$(ls "$GITHUB_WORKSPACE"/managers/*.apk 2>/dev/null | head -1 || true)"
+            if [ -z "$FMGR" ]; then
+              mkdir -p "$RUNNER_TEMP/fmgr"
+              GH_TOKEN="${{ github.token }}" gh release download --repo LyraVoid/FinaSU --pattern '*.apk' --dir "$RUNNER_TEMP/fmgr" 2>/dev/null || true
+              FMGR="$(ls "$RUNNER_TEMP"/fmgr/*.apk 2>/dev/null | head -1 || true)"
+            fi
+            if [ -n "$FMGR" ] && [ -f "$GITHUB_WORKSPACE/scripts/apk_sig.py" ]; then
+              SIG="$(python3 "$GITHUB_WORKSPACE/scripts/apk_sig.py" "$FMGR" 2>/dev/null || true)"
+              if printf '%s' "$SIG" | grep -qE '^0x[0-9a-f]+ [0-9a-f]{64}$'; then
+                FINA_SZ="${SIG%% *}"; FINA_HASH="${SIG##* }"
+                echo "[+] FinaSU manager sig computed from $(basename "$FMGR"): $FINA_SZ"
+              else
+                echo "::warning::FinaSU: live sig compute failed; using known v1.4.x fallback"
+              fi
+            fi
+            sed -i "s/^KSU_EXPECTED_SIZE := .*/KSU_EXPECTED_SIZE := $FINA_SZ/" "$ROOT_DIR/kernel/Kbuild"
+            sed -i "s/^KSU_EXPECTED_HASH := .*/KSU_EXPECTED_HASH := $FINA_HASH/" "$ROOT_DIR/kernel/Kbuild"
+            grep -q "$FINA_HASH" "$ROOT_DIR/kernel/Kbuild" \
+              && echo "[+] FinaSU: trusted manager baked ($FINA_SZ)" \
+              || echo "::warning::FinaSU: could not bake manager signature (Kbuild format changed)"
+          fi
+
+      - name: Apply SUSFS (${{ matrix.susfs_branch }}) & Regular WildKernels Feature Patches
+        shell: bash
+        run: |
+          cd kernel_workspace
+          PATCH_DIR="$GITHUB_WORKSPACE/kernel_workspace/wild_patches"
+          SUSFS_DIR="$GITHUB_WORKSPACE/kernel_workspace/susfs4ksu"
+          KVER_SHORT="${{ matrix.kver }}"
+          SUBLEVEL="${{ steps.sync-kernel.outputs.resolved_sublevel }}"
+
+          # 1. SUSFS + Root Compat + Ptrace/Unicode Fixes
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
+            echo "[+] Copying SUSFS fs/ and include/linux/ sources..."
+            cp -rf "$SUSFS_DIR/kernel_patches/fs/"* common/fs/ || true
+            cp -rf "$SUSFS_DIR/kernel_patches/include/linux/"* common/include/linux/ || true
+
+            # Root-side susfs. Plain tiann KernelSU is the only one without susfs,
+            # so it's the only one that gets the 10_enable patch. Next (dev-susfs),
+            # BakaSU, ReSukiSU and FinaSU already carry susfs, so handing them
+            # 10_enable or the tiann-shaped drift-fix scripts just breaks them -
+            # that's what blew up FinaSU's core/init.c. They only need the
+            # kernel-side 50_add further down. BakaSU's the odd one: it wants a
+            # tiny file of global symbols the susfs patch expects, which the
+            # bakasu_compat script drops in if it's around.
+            case "${{ matrix.root_variant }}" in
+              KernelSU)
+                if [ -d "$SUSFS_DIR/kernel_patches/KernelSU" ]; then
+                  for kp in "$SUSFS_DIR"/kernel_patches/KernelSU/*.patch; do
+                    [ -f "$kp" ] && (cd KernelSU && patch -p1 --forward --fuzz=3 < "$kp") || true
+                  done
+                fi
+                ;;
+              BakaSU)
+                if [ -f "$GITHUB_WORKSPACE/.github/actions/susfs/bakasu_compat/apply.sh" ]; then
+                  bash "$GITHUB_WORKSPACE/.github/actions/susfs/bakasu_compat/apply.sh" BakaSU "${{ matrix.kernel_version }}" "${SUBLEVEL}" || true
+                fi
+                ;;
+              *)
+                echo "[+] ${{ matrix.root_variant }}: native SUSFS, kernel-side 50_add only (no 10_enable / no compat)"
+                ;;
+            esac
+
+            cd common
+            for p in "$SUSFS_DIR"/kernel_patches/50_add_susfs_in_gki-*.patch; do
+              [ -f "$p" ] && patch -p1 --forward --fuzz=3 < "$p" || true
+            done
+
+            # SUSFS core owns the correct fs/notify/fdinfo.c changes for the
+            # current tree now that the perf step no longer double-patches it,
+            # so no fdinfo.c "restore" is needed - restoring stock would only
+            # delete SUSFS's SUS_KSTAT fdinfo spoofing.
+
+            # Ptrace leak fix needs include/linux/tracehook.h, gone after 5.17
+            # (on 6.x it half-applies into signal.c); gate it to 5.x.
+            case "$KVER_SHORT" in
+              5.10|5.15) [ -f "$PATCH_DIR/gki_ptrace.patch" ] && patch -p1 --forward --fuzz=3 < "$PATCH_DIR/gki_ptrace.patch" || true ;;
+            esac
+
+            # utf8-norm bypass fix ships two variants split at 6.1; apply the
+            # matching one instead of letting both fight over the file.
+            case "$KVER_SHORT" in
+              5.10|5.15) U="$PATCH_DIR/common/unicode_bypass_fix_6.1-.patch" ;;
+              *)         U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch" ;;
+            esac
+            [ -f "$U" ] && patch -p1 --forward --fuzz=3 < "$U" || true
+          else
+            cd common
+          fi
+
+          find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
+
+          # 2. Baseband Guard (BBG)
+          if [ "${{ (inputs.security_guards == 'bbg' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}" = "true" ]; then
+            echo "[+] Integrating Baseband Guard (BBG)..."
+            # Prefer the vendored Baseband-guard (sources/baseband-guard, pinned).
+            # A throwaway 'git init' (no remote) makes BBG's own setup.sh take its
+            # no-clone / no-fetch path, so it wires the tree from the vendored files
+            # without pulling upstream. Fall back to the upstream setup.sh otherwise.
+            BV="$GITHUB_WORKSPACE/sources/baseband-guard"
+            if [ -d "$BV" ]; then
+              echo "[+] Using vendored Baseband-guard from repo (pinned)"
+              rm -rf Baseband-guard && cp -a "$BV" Baseband-guard
+              git -C Baseband-guard init -q 2>/dev/null || true
+              bash Baseband-guard/setup.sh || true
+            else
+              curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+            fi
+            find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+            # BBG's own Makefile bails ("BBG not enable in CONFIG_LSM") unless
+            # 'baseband_guard' is in CONFIG_LSM. setup.sh drops the source in but
+            # never touches the LSM list, so we add it ourselves - into the
+            # default in security/Kconfig (same thing WildKernels' bbg action
+            # does) and into any explicit CONFIG_LSM= in the defconfig.
+            if [ -d security/baseband-guard ]; then
+              sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+              DEF="arch/arm64/configs/gki_defconfig"
+              if grep -q '^CONFIG_LSM=' "$DEF" && ! grep -q '^CONFIG_LSM=.*baseband_guard' "$DEF"; then
+                sed -i 's/^\(CONFIG_LSM="[^"]*\)selinux/\1selinux,baseband_guard/' "$DEF"
+              fi
+              grep -q baseband_guard security/Kconfig \
+                && echo "[+] baseband_guard added to CONFIG_LSM default" \
+                || echo "::warning::BBG: could not add baseband_guard to CONFIG_LSM"
+            fi
+          fi
+
+          # 2b. NV write guard (opt-in, default OFF). Protects the modem's
+          # irreplaceable nv_protected.bin (RF calibration / IMEI) from a torn
+          # or stray write - the classic way a Shannon efs ends up bricked.
+          # nv_normal.bin is left writable on purpose so the modem can still
+          # heal itself. Ships as a tiny LSM; only bites once it is in CONFIG_LSM.
+          if [ "${{ (inputs.security_guards == 'nv' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}" = "true" ]; then
+            echo "[+] Integrating NV write guard (nv_guard LSM)..."
+            NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
+            # Copy the sources in rather than applying a context patch: the
+            # patch was cut against 6.6, and security/Kconfig + security/Makefile
+            # differ across 5.10..6.18, so `patch --fuzz` lands at the wrong
+            # offset on other trees (it corrupted security/Kconfig on 5.10).
+            # The .c/.Kconfig/.Makefile themselves are version-independent.
+            if [ ! -f security/nv_guard/nv_guard.c ] && [ -f "$NVD/nv_guard.c" ]; then
+              mkdir -p security/nv_guard
+              cp "$NVD/nv_guard.c" "$NVD/Kconfig" "$NVD/Makefile" security/nv_guard/
+              echo "[+] nv_guard sources copied into security/nv_guard/"
+            fi
+            if [ -f security/nv_guard/nv_guard.c ]; then
+              # Wire Kconfig/Makefile by anchor, idempotently - no diff to fuzz.
+              # keys/Kconfig is the first `source` inside the security menu on
+              # every GKI version, so inserting after it is always in-menu.
+              grep -q 'security/nv_guard/Kconfig' security/Kconfig || \
+                sed -i 's#^source "security/keys/Kconfig"#&\nsource "security/nv_guard/Kconfig"#' security/Kconfig
+              grep -q 'nv_guard/' security/Makefile || \
+                printf 'obj-$(CONFIG_NV_WRITE_GUARD) += nv_guard/\n' >> security/Makefile
+              DEF="arch/arm64/configs/gki_defconfig"
+              grep -q '^CONFIG_NV_WRITE_GUARD=y' "$DEF" || echo 'CONFIG_NV_WRITE_GUARD=y' >> "$DEF"
+              sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /nv_guard/! s/selinux/selinux,nv_guard/ } }' security/Kconfig
+              if grep -q '^CONFIG_LSM=' "$DEF" && ! grep -q '^CONFIG_LSM=.*nv_guard' "$DEF"; then
+                sed -i 's/^\(CONFIG_LSM="[^"]*\)selinux/\1selinux,nv_guard/' "$DEF"
+              fi
+              echo "[+] nv_guard wired (sources + Kconfig/Makefile + CONFIG_LSM)"
+            else
+              echo "::warning::nv_write_guard requested but kernel-patches/nv_guard sources not found; skipping"
+            fi
+          fi
+
+          # 2c. Security patch level.
+          #   monthly    - whatever the base sync pulled (latest tagged GKI/LTS).
+          #                That already IS the Android monthly CVE set, merged
+          #                and tested together upstream. Nothing extra to do.
+          #   latest-cve - also fast-forward this series' post-release stable
+          #                CVE fixes on top (git am --3way). Anything that does
+          #                not apply cleanly is ABORTED and logged, never fuzzed
+          #                in. Bleeding edge; may apply nothing if the base tag
+          #                is not reachable in the synced tree. See README.
+          #   none       - build the base exactly as pinned.
+          case "${{ inputs.security_patches }}" in
+            latest-cve)
+              echo "[+] security_patches=latest-cve: topping up with post-release stable CVE fixes..."
+              git config user.email "ci@local" 2>/dev/null || true
+              git config user.name "ci" 2>/dev/null || true
+              KVER="$(make -s kernelversion 2>/dev/null || true)"
+              SERIES="$(echo "$KVER" | cut -d. -f1-2)"
+              OUTD="$GITHUB_WORKSPACE/cve-out"; mkdir -p "$OUTD"
+              OKF="$OUTD/cve-applied.txt"; SKF="$OUTD/cve-skipped.txt"; : > "$OKF"; : > "$SKF"
+              STABLE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git"
+              # The synced Android tree never carries upstream stable tags, so the
+              # base tag has to come from linux-stable too, or it's never found.
+              if git fetch --no-tags --depth=400 "$STABLE" "linux-${SERIES}.y:refs/cve_tip" "refs/tags/v${KVER}:refs/tags/v${KVER}" 2>/dev/null; then
+                # The base must sit inside the fetched history, otherwise rev-list
+                # walks past it into commits the tree already has. Deepen until it does.
+                for d in 800 1600 3200; do
+                  git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null && break
+                  git fetch --no-tags --deepen="$d" "$STABLE" "linux-${SERIES}.y:refs/cve_tip" 2>/dev/null || break
+                done
+                if git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null; then
+                  mapfile -t SHAS < <(git rev-list --reverse "v${KVER}..refs/cve_tip" 2>/dev/null)
+                  echo "[i] ${SERIES}: ${#SHAS[@]} post-${KVER} stable commits to try"
+                  for sha in "${SHAS[@]}"; do
+                    subj="$(git log -1 --format='%s' "$sha" 2>/dev/null || true)"
+                    if git format-patch -1 --stdout "$sha" 2>/dev/null | git am --3way >/dev/null 2>&1; then
+                      echo "$sha  $subj" >> "$OKF"
+                    else
+                      git am --abort >/dev/null 2>&1 || true
+                      echo "$sha  $subj" >> "$SKF"
+                    fi
+                  done
+                  echo "[+] latest-cve: applied $(wc -l < "$OKF" | tr -d ' '), skipped $(wc -l < "$SKF" | tr -d ' ') (lists in cve-out/)"
+                else
+                  echo "::warning::latest-cve: base tag v${KVER} not reachable in the synced tree; skipping CVE top-up (monthly base is unchanged)"
+                fi
+              else
+                echo "::warning::latest-cve: could not fetch the stable tree for ${SERIES}; skipping CVE top-up"
+              fi
+              ;;
+            none)
+              echo "[i] security_patches=none: building the base exactly as pinned"
+              ;;
+            *)
+              echo "[i] security_patches=monthly: latest tagged GKI/LTS base carries the Android monthly CVE set"
+              ;;
+          esac
+
+          # 3. NTSync. drivers/misc/ntsync.c ships only on 6.12; every other
+          # family needs ntsync_base.patch to ADD it, plus a per-family compat
+          # patch that wires Kconfig/Makefile. The old `find -path "*6.6*"` only
+          # matched the compat patch (ntsync_base has no version in its name),
+          # so CONFIG_NTSYNC=y referenced a drivers/misc/ntsync.o whose source
+          # was never created -> "No rule to make target drivers/misc/ntsync.o".
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ]; then
+            echo "[+] Applying NTSync for ${{ matrix.kernel_version }}..."
+            NT="$PATCH_DIR/common/ntsync"
+            # 6.12 already carries ntsync.c/.h; drop them so base re-adds a known copy
+            if [ "${{ matrix.kernel_version }}" = "android16-6.12" ]; then
+              rm -f include/uapi/linux/ntsync.h drivers/misc/ntsync.c
+            fi
+            case "${{ matrix.kernel_version }}" in
+              android13-5.10) COMPAT="$NT/ntsync_compat_android12-5.10.patch" ;;
+              android14-5.15) COMPAT="$NT/ntsync_compat_android13-5.15.patch" ;;
+              *)              COMPAT="$NT/ntsync_compat_${{ matrix.kernel_version }}.patch" ;;
+            esac
+            if [ -f "$COMPAT" ]; then patch -p1 --forward --fuzz=3 < "$COMPAT" || true; else echo "::warning::NTSync: compat patch not found ($COMPAT)"; fi
+            if [ -f "$NT/ntsync_base.patch" ]; then patch -p1 --forward --fuzz=3 < "$NT/ntsync_base.patch" || true; else echo "::warning::NTSync: ntsync_base.patch not found"; fi
+          fi
+
+          # 4. Networking (BBRv3 / Netfilter for matching kernel series)
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
+            echo "[+] Applying Networking patches for ${KVER_SHORT}..."
+            find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+          fi
+
+          # 5. DroidSpaces-OSS
+          if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
+            echo "[+] Applying DroidSpaces-OSS patches..."
+            find "$PATCH_DIR" -name "*droidspaces*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+          fi
+
+          # 6. Performance tuning patches.
+          # Do NOT point this at wild_patches/wild: that tree is archived SUSFS
+          # fix-ups for old 5.x/preview layouts (base.c, fdinfo.c, task_mmu.c),
+          # manual hook patches and KSU-Next bundles. Run with --fuzz over a
+          # current 6.x tree they stack stale code on top of SUSFS - that is what
+          # broke fs/proc/base.c here (BIT_SUS_MAPS / vma) and fs/notify/fdinfo.c
+          # before. Only the real perf patches from common/, each one that does
+          # not apply cleanly is skipped (dry-run first) instead of fuzzing in.
+          if [ "${{ inputs.enable_performance }}" = "true" ]; then
+            echo "[+] Applying WildKernels performance patches..."
+            for name in \
+              add_timeout_wakelocks_globally adjust_cpu_scan_order \
+              avoid_extra_s2idle_wake_attempts clear_page_16bytes_align \
+              disable_cache_hot_buddy f2fs_enlarge_min_fsync_blocks \
+              f2fs_reduce_congestion file_struct_8bytes_align \
+              increase_ext4_default_commit_age increase_sk_mem_packets \
+              int_sqrt mem_opt_prefetch minimise_wakeup_time optimise_memcmp \
+              optimized_mem_operations reduce_cache_pressure reduce_freeze_timeout \
+              reduce_gc_thread_sleep_time reduce_pci_pme_wakeups \
+              use_unlikely_wrap_cpufreq; do
+              p="$PATCH_DIR/common/${name}.patch"
+              [ -f "$p" ] || continue
+              if patch -p1 -N -s --dry-run -i "$p" >/dev/null 2>&1; then
+                patch -p1 -N -s --no-backup-if-mismatch -i "$p"
+                echo "  [ok]   $name"
+              else
+                echo "  [skip] $name (doesn't apply on ${{ matrix.kernel_version }})"
+              fi
+            done
+          fi
+
+          # 7. Module Check Bypass (5.10 uses kernel/module.c; 5.15+/6.x uses kernel/module/version.c)
+          if [ "${{ inputs.allow_version_mismatch }}" = "true" ]; then
+            echo "[+] Applying Module Check Bypass..."
+            if [ -f kernel/module/version.c ]; then
+              sed -i 's/return 0;/return 1;/g' kernel/module/version.c || true
+            elif [ -f kernel/module.c ]; then
+              sed -i '/check_version/,/^}/ s/return 0;/return 1;/g' kernel/module.c || true
+            fi
+          fi
+
+          find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
+
+      - name: Prepare Mosey wonder driver source (out-of-tree, cfg80211-only)
+        if: ${{ inputs.mosey_mode != 'disabled' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GKI ships cfg80211 as a vendor module and never builds mac80211 into
+          # the image, so the old in-tree mac80211 driver + forced
+          # CONFIG_CFG80211/MAC80211=y both broke the build and would clash with
+          # the phone's own Wi-Fi stack. This driver is cfg80211-only, built
+          # out-of-tree below against the finished kernel and shipped as its own
+          # KSU/Magisk module; the kernel image is left exactly as a normal Wild
+          # build produces it.
+          SRC="$GITHUB_WORKSPACE/mosey_src"
+          rm -rf "$SRC"; mkdir -p "$SRC"
+
+          cat > "$SRC/Kbuild" <<'KBUILD_EOF'
+          obj-m += wonder_mosey_wild.o
+          KBUILD_EOF
+
+          cat > "$SRC/wonder_mosey_wild.c" <<'WONDER_EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * wonder_mosey_wild - fake "wonder" wiphy for Mosey (Quick Share / AirDrop)
+           *
+           * mosey_server wants a phy called "wonder" it can hang a monitor
+           * interface off (wonder0), tune to ch149 and poke with Broadcom-style
+           * vendor commands (OUI 0x001A11, subcmds 1..5). Pixel 9/10 get that from
+           * bcmdhd's wondertap, everything else gets this.
+           *
+           * Interface follows thelok1s/mosey-extended's README. This is a plain
+           * cfg80211 driver on purpose: phones ship cfg80211 as a vendor module but
+           * most never load mac80211, so depending on it would rule out half the
+           * devices out there.
+           *
+           * No radio behind it. Frames sent on wonder0 are dropped, nothing is ever
+           * received. It only exists so mosey_server's bring-up completes.
+           *
+           * Pixel 10 series (blazer) has native wondertap in the BCM4398 (bcmdhd), so
+           * there this driver is a no-op fallback - it loads only on devices that have
+           * no real wonder phy. The 5 GHz table leads with ch149/5745, the channel
+           * Quick Share / mosey uses, so an emulated phy advertises it first.
+           *
+           * @Dev_DcS
+           */
+
+          #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+          #include <linux/module.h>
+          #include <linux/moduleparam.h>
+          #include <linux/etherdevice.h>
+          #include <linux/netdevice.h>
+          #include <linux/if_arp.h>
+          #include <linux/rtnetlink.h>
+          #include <linux/spinlock.h>
+          #include <linux/version.h>
+          #include <net/cfg80211.h>
+          #include <net/netlink.h>
+
+          #define WONDER_OUI		0x001A11
+          #define WONDER_MAX_IFACES	4
+
+          enum wonder_subcmd {
+          	WONDER_SET_FREQ		= 1,
+          	WONDER_SET_FILTER	= 2,
+          	WONDER_SET_FIXED_TX_RATE = 3,
+          	WONDER_SET_REG		= 4,
+          	WONDER_GET_IF_MAC_ADDR	= 5,
+          };
+
+          /*
+           * 5.12 moved interface add/del under the wiphy mutex and gave drivers
+           * cfg80211_{,un}register_netdevice() for it.
+           */
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+          #define WONDER_WIPHY_MTX 1
+          #endif
+
+          static struct wiphy *wonder_wiphy;
+
+          /* ---- module params ---------------------------------------------------- */
+
+          static DEFINE_SPINLOCK(wonder_mac_lock);
+          static u8 wonder_mac[ETH_ALEN] = { 0x6a, 0xb0, 0x5d, 0xc7, 0x27, 0x3d };
+
+          static void wonder_get_mac(u8 *out)
+          {
+          	spin_lock_bh(&wonder_mac_lock);
+          	ether_addr_copy(out, wonder_mac);
+          	spin_unlock_bh(&wonder_mac_lock);
+          }
+
+          static int wonder_mac_set(const char *val, const struct kernel_param *kp)
+          {
+          	char buf[24];	/* "xx:xx:xx:xx:xx:xx" plus whatever echo tacks on */
+          	u8 mac[ETH_ALEN];
+
+          	if (strscpy(buf, val, sizeof(buf)) < 0)
+          		return -EINVAL;
+          	if (!mac_pton(strim(buf), mac))
+          		return -EINVAL;
+          	/* unicast + locally administered, same rule mosey-extended documents */
+          	if (!is_valid_ether_addr(mac) || !(mac[0] & 0x02))
+          		return -EINVAL;
+
+          	spin_lock_bh(&wonder_mac_lock);
+          	ether_addr_copy(wonder_mac, mac);
+          	spin_unlock_bh(&wonder_mac_lock);
+          	return 0;
+          }
+
+          static int wonder_mac_get(char *buf, const struct kernel_param *kp)
+          {
+          	u8 mac[ETH_ALEN];
+
+          	wonder_get_mac(mac);
+          	return sysfs_emit(buf, "%pM\n", mac);
+          }
+
+          static const struct kernel_param_ops wonder_mac_ops = {
+          	.set = wonder_mac_set,
+          	.get = wonder_mac_get,
+          };
+          module_param_cb(mac_addr, &wonder_mac_ops, NULL, 0644);
+          MODULE_PARM_DESC(mac_addr,
+          	"MAC handed back for vendor subcmd 5 (locally administered, default 6a:b0:5d:c7:27:3d)");
+
+          /*
+           * Nobody outside Google knows how mosey_server unpacks the subcmd 5 reply.
+           * 0 = bare 6 bytes in VENDOR_DATA, 1 = wrapped in nl attribute 1.
+           * Writable so it can be flipped on a live device without rebuilding.
+           */
+          static int mac_reply_fmt;
+          module_param(mac_reply_fmt, int, 0644);
+          MODULE_PARM_DESC(mac_reply_fmt, "Subcmd 5 reply: 0 = raw bytes (default), 1 = nla type 1");
+
+          /* ---- monitor netdev --------------------------------------------------- */
+
+          static netdev_tx_t wonder_xmit(struct sk_buff *skb, struct net_device *dev)
+          {
+          	dev->stats.tx_dropped++;
+          	dev_kfree_skb_any(skb);
+          	return NETDEV_TX_OK;
+          }
+
+          static const struct net_device_ops wonder_netdev_ops = {
+          	.ndo_start_xmit = wonder_xmit,
+          };
+
+          static void wonder_netdev_setup(struct net_device *dev)
+          {
+          	ether_setup(dev);
+          	dev->type = ARPHRD_IEEE80211_RADIOTAP;
+          	dev->header_ops = NULL;
+          	dev->hard_header_len = 0;
+          	dev->netdev_ops = &wonder_netdev_ops;
+          	dev->needs_free_netdev = true;
+          	dev->priv_flags |= IFF_NO_QUEUE;
+          	dev->flags &= ~IFF_MULTICAST;
+          }
+
+          static struct wireless_dev *wonder_add_iface(struct wiphy *wiphy, const char *name,
+          					     unsigned char name_assign_type,
+          					     enum nl80211_iftype type,
+          					     struct vif_params *params)
+          {
+          	struct wireless_dev *wdev;
+          	struct net_device *dev;
+          	u8 mac[ETH_ALEN];
+          	int count = 0;
+          	int err;
+
+          	if (type != NL80211_IFTYPE_MONITOR)
+          		return ERR_PTR(-EOPNOTSUPP);
+
+          	list_for_each_entry(wdev, &wiphy->wdev_list, list)
+          		count++;
+          	if (count >= WONDER_MAX_IFACES)
+          		return ERR_PTR(-EBUSY);
+
+          	dev = alloc_netdev(sizeof(*wdev), name, name_assign_type, wonder_netdev_setup);
+          	if (!dev)
+          		return ERR_PTR(-ENOMEM);
+
+          	wonder_get_mac(mac);
+          	eth_hw_addr_set(dev, mac);
+
+          	wdev = netdev_priv(dev);
+          	wdev->wiphy = wiphy;
+          	wdev->iftype = type;
+          	wdev->netdev = dev;
+          	dev->ieee80211_ptr = wdev;
+          	SET_NETDEV_DEV(dev, wiphy_dev(wiphy));
+
+          #ifdef WONDER_WIPHY_MTX
+          	err = cfg80211_register_netdevice(dev);
+          #else
+          	err = register_netdevice(dev);
+          #endif
+          	if (err) {
+          		free_netdev(dev);
+          		return ERR_PTR(err);
+          	}
+
+          	netif_carrier_on(dev);
+          	pr_info("%s up on %s\n", dev->name, wiphy_name(wiphy));
+          	return wdev;
+          }
+
+          /* caller holds RTNL (and the wiphy mutex on 5.12+) */
+          static void wonder_drop_iface(struct wireless_dev *wdev)
+          {
+          	if (!wdev->netdev)
+          		return;
+          #ifdef WONDER_WIPHY_MTX
+          	cfg80211_unregister_netdevice(wdev->netdev);
+          #else
+          	unregister_netdevice(wdev->netdev);
+          #endif
+          }
+
+          static int wonder_del_iface(struct wiphy *wiphy, struct wireless_dev *wdev)
+          {
+          	wonder_drop_iface(wdev);
+          	return 0;
+          }
+
+          static int wonder_change_iface(struct wiphy *wiphy, struct net_device *dev,
+          			       enum nl80211_iftype type, struct vif_params *params)
+          {
+          	if (type != NL80211_IFTYPE_MONITOR)
+          		return -EOPNOTSUPP;
+          	/* cfg80211 WARNs if the driver says ok but iftype didn't follow */
+          	dev->ieee80211_ptr->iftype = type;
+          	return 0;
+          }
+
+          /* 6.13 started passing the netdev in (android16-6.12 still has the old form) */
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+          static int wonder_set_monitor_channel(struct wiphy *wiphy, struct net_device *dev,
+          				      struct cfg80211_chan_def *chandef)
+          #else
+          static int wonder_set_monitor_channel(struct wiphy *wiphy,
+          				      struct cfg80211_chan_def *chandef)
+          #endif
+          {
+          	pr_debug("monitor channel %u MHz\n", chandef->chan->center_freq);
+          	return 0;
+          }
+
+          static const struct cfg80211_ops wonder_cfg_ops = {
+          	.add_virtual_intf	= wonder_add_iface,
+          	.del_virtual_intf	= wonder_del_iface,
+          	.change_virtual_intf	= wonder_change_iface,
+          	.set_monitor_channel	= wonder_set_monitor_channel,
+          };
+
+          /* ---- vendor commands -------------------------------------------------- */
+
+          static int wonder_vendor_ack(struct wiphy *wiphy, struct wireless_dev *wdev,
+          			     const void *data, int len)
+          {
+          	/* subcmds 1-4 only configure hardware that isn't there */
+          	return 0;
+          }
+
+          static int wonder_vendor_get_mac(struct wiphy *wiphy, struct wireless_dev *wdev,
+          				 const void *data, int len)
+          {
+          	struct sk_buff *skb;
+          	u8 mac[ETH_ALEN];
+
+          	wonder_get_mac(mac);
+
+          	skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, nla_total_size(ETH_ALEN));
+          	if (!skb)
+          		return -ENOMEM;
+
+          	if (READ_ONCE(mac_reply_fmt) == 1) {
+          		if (nla_put(skb, 1, ETH_ALEN, mac)) {
+          			kfree_skb(skb);
+          			return -EMSGSIZE;
+          		}
+          	} else {
+          		skb_put_data(skb, mac, ETH_ALEN);
+          	}
+
+          	return cfg80211_vendor_cmd_reply(skb);
+          }
+
+          #define WONDER_VCMD(_sub, _fn) {				\
+          	.info	= { .vendor_id = WONDER_OUI, .subcmd = (_sub) },\
+          	.doit	= (_fn),					\
+          	.policy	= VENDOR_CMD_RAW_DATA,				\
+          }
+
+          /*
+           * No NEED_WDEV flag: whether mosey_server targets the phy or wonder0
+           * isn't documented, and without the flag nl80211 takes either.
+           */
+          static const struct wiphy_vendor_command wonder_vendor_cmds[] = {
+          	WONDER_VCMD(WONDER_SET_FREQ, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_SET_FILTER, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_SET_FIXED_TX_RATE, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_SET_REG, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_GET_IF_MAC_ADDR, wonder_vendor_get_mac),
+          };
+
+          /* ---- bands ------------------------------------------------------------ */
+
+          #define CHAN2G(_ch, _freq) { .band = NL80211_BAND_2GHZ, .center_freq = (_freq), \
+          			     .hw_value = (_ch), .max_power = 20 }
+          #define CHAN5G(_ch, _freq) { .band = NL80211_BAND_5GHZ, .center_freq = (_freq), \
+          			     .hw_value = (_ch), .max_power = 20 }
+
+          static struct ieee80211_channel wonder_chan_2g[] = {
+          	CHAN2G(1, 2412), CHAN2G(6, 2437), CHAN2G(11, 2462),
+          };
+
+          static struct ieee80211_channel wonder_chan_5g[] = {
+          	/* ch149/5745 first: the channel Quick Share / mosey (Pixel "blazer") uses */
+          	CHAN5G(149, 5745), CHAN5G(153, 5765), CHAN5G(157, 5785), CHAN5G(161, 5805),
+          	CHAN5G(36, 5180), CHAN5G(44, 5220),
+          };
+
+          static struct ieee80211_rate wonder_rates_2g[] = {
+          	{ .bitrate = 10 }, { .bitrate = 20 }, { .bitrate = 55 }, { .bitrate = 110 },
+          	{ .bitrate = 60 }, { .bitrate = 120 }, { .bitrate = 240 }, { .bitrate = 540 },
+          };
+
+          /* 5 GHz has no CCK, so it gets the OFDM tail of the same table */
+          static struct ieee80211_supported_band wonder_band_2g = {
+          	.band		= NL80211_BAND_2GHZ,
+          	.channels	= wonder_chan_2g,
+          	.n_channels	= ARRAY_SIZE(wonder_chan_2g),
+          	.bitrates	= wonder_rates_2g,
+          	.n_bitrates	= ARRAY_SIZE(wonder_rates_2g),
+          };
+
+          static struct ieee80211_supported_band wonder_band_5g = {
+          	.band		= NL80211_BAND_5GHZ,
+          	.channels	= wonder_chan_5g,
+          	.n_channels	= ARRAY_SIZE(wonder_chan_5g),
+          	.bitrates	= wonder_rates_2g + 4,
+          	.n_bitrates	= ARRAY_SIZE(wonder_rates_2g) - 4,
+          };
+
+          /* ---- init / exit ------------------------------------------------------ */
+
+          static int __init wonder_init(void)
+          {
+          	struct wiphy *wiphy;
+          	u8 mac[ETH_ALEN];
+          	int err;
+
+          	wiphy = wiphy_new_nm(&wonder_cfg_ops, 0, "wonder");
+          	if (!wiphy)
+          		return -ENOMEM;
+
+          	wonder_get_mac(mac);
+          	ether_addr_copy(wiphy->perm_addr, mac);
+
+          	wiphy->interface_modes = BIT(NL80211_IFTYPE_MONITOR);
+          	wiphy->bands[NL80211_BAND_2GHZ] = &wonder_band_2g;
+          	wiphy->bands[NL80211_BAND_5GHZ] = &wonder_band_5g;
+          	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+          	wiphy->vendor_commands = wonder_vendor_cmds;
+          	wiphy->n_vendor_commands = ARRAY_SIZE(wonder_vendor_cmds);
+          	/* mosey may ask for an "active" monitor; nothing here cares either way */
+          	wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR;
+
+          	err = wiphy_register(wiphy);
+          	if (err) {
+          		pr_err("wiphy_register: %d (is the phy name 'wonder' taken?)\n", err);
+          		wiphy_free(wiphy);
+          		return err;
+          	}
+
+          	wonder_wiphy = wiphy;
+          	pr_info("registered %s, mac %pM\n", wiphy_name(wiphy), mac);
+          	return 0;
+          }
+
+          static void __exit wonder_exit(void)
+          {
+          	struct wireless_dev *wdev, *tmp;
+          	struct wiphy *wiphy = wonder_wiphy;
+
+          	rtnl_lock();
+          #ifdef WONDER_WIPHY_MTX
+          	wiphy_lock(wiphy);
+          #endif
+          	list_for_each_entry_safe(wdev, tmp, &wiphy->wdev_list, list)
+          		wonder_drop_iface(wdev);
+          #ifdef WONDER_WIPHY_MTX
+          	wiphy_unlock(wiphy);
+          #endif
+          	rtnl_unlock();
+
+          	wiphy_unregister(wiphy);
+          	wiphy_free(wiphy);
+          }
+
+          module_init(wonder_init);
+          module_exit(wonder_exit);
+
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("Dev_DcS");
+          MODULE_DESCRIPTION("Virtual 'wonder' cfg80211 phy for Mosey / Quick Share");
+          MODULE_SOFTDEP("pre: cfg80211");
+          WONDER_EOF
+
+      - name: Configure Kernel (`gki_defconfig` & Kleaf Protected Exports for ${{ matrix.kernel_version }})
+        shell: bash
+        env:
+          CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
+        run: |
+          cd kernel_workspace/common
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+
+          set_kconfig() {
+            local key="$1"
+            local val="$2"
+            sed -i "/^${key}=/d" "$DEFCONFIG"
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG"
+            if [ "$val" = "n" ]; then
+              echo "# ${key} is not set" >> "$DEFCONFIG"
+            else
+              echo "${key}=${val}" >> "$DEFCONFIG"
+            fi
+          }
+
+          # Custom kernel name (replaces the -maybe-dirty scm marker in uname).
+          # Read from an env var so a malicious input can't inject shell.
+          # CONFIG_LOCALVERSION adds the name; AUTO=n drops the git/dirty suffix.
+          if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
+            KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
+            if [ -n "$KN" ]; then
+              set_kconfig CONFIG_LOCALVERSION "\"-$KN\""
+              set_kconfig CONFIG_LOCALVERSION_AUTO n
+              echo "[+] Kernel name: -$KN"
+            fi
+          fi
+
+          # Disable CONFIG_WERROR so unused-variable warnings in patched files never fail the build
+          set_kconfig CONFIG_WERROR n
+          # ZRAM default compressor (@Dev_DcS). lz4 is the fastest and the
+          # default; zstd trades a little CPU for a notably higher ratio (more
+          # effective RAM). Both are in the GKI crypto set - we just enable the
+          # backend and point ZRAM's default at it. Runtime can still override.
+          case "${{ inputs.zram_algo }}" in
+            zstd)
+              set_kconfig CONFIG_CRYPTO_ZSTD y
+              set_kconfig CONFIG_ZRAM_DEF_COMP_ZSTD y
+              set_kconfig CONFIG_ZRAM_DEF_COMP "\"zstd\""
+              echo "[+] ZRAM default compressor: zstd"
+              ;;
+            *)
+              set_kconfig CONFIG_CRYPTO_LZ4 y
+              set_kconfig CONFIG_ZRAM_DEF_COMP_LZ4 y
+              echo "[+] ZRAM default compressor: lz4 (default)"
+              ;;
+          esac
+          echo "KBUILD_CFLAGS += -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-unused-label -Wno-unused-but-set-variable" >> Makefile
+
+          if [ "${{ matrix.root_variant }}" != "NoRoot" ]; then
+            set_kconfig CONFIG_KSU y
+            set_kconfig CONFIG_KALLSYMS_ALL y
+            set_kconfig CONFIG_KPROBES y
+          fi
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -f fs/susfs.c ]; then
+            set_kconfig CONFIG_KSU_SUSFS y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_PATH y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_MOUNT y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_KSTAT y
+            set_kconfig CONFIG_KSU_SUSFS_SPOOF_UNAME y
+            set_kconfig CONFIG_KSU_SUSFS_ENABLE_LOG y
+            set_kconfig CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS y
+            set_kconfig CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
+            set_kconfig CONFIG_KSU_SUSFS_OPEN_REDIRECT y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_MAP y
+          fi
+
+          if [ "${{ inputs.enable_nomount }}" = "true" ]; then
+            set_kconfig CONFIG_TMPFS_XATTR y
+            set_kconfig CONFIG_TMPFS_POSIX_ACL y
+          fi
+
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
+            set_kconfig CONFIG_WIREGUARD y
+            set_kconfig CONFIG_TCP_CONG_ADVANCED y
+            set_kconfig CONFIG_TCP_CONG_BBR y
+            set_kconfig CONFIG_NET_SCH_FQ y
+            set_kconfig CONFIG_NET_SCH_CAKE y
+            set_kconfig CONFIG_IP_SET y
+            set_kconfig CONFIG_IP_SET_MAX 256
+            set_kconfig CONFIG_NETFILTER_XT_TARGET_HL y
+            set_kconfig CONFIG_NETFILTER_XT_TARGET_CONNMARK y
+            set_kconfig CONFIG_CIFS y
+          fi
+
+          if [ "${{ inputs.enable_bpf }}" = "true" ]; then
+            set_kconfig CONFIG_BPF_SYSCALL y
+            set_kconfig CONFIG_BPF_JIT y
+            set_kconfig CONFIG_DEBUG_INFO_BTF y
+          fi
+
+          # only enable NTSync if its source actually made it into the tree,
+          # else built-in.a references a drivers/misc/ntsync.o with no source
+          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
+            set_kconfig CONFIG_NTSYNC y
+          fi
+
+          # (Mosey no longer forces cfg80211/mac80211/nlmon into the image;
+          #  the wonder phy is a separate out-of-tree module - see below.)
+
+          # Remove check_defconfig and relax KMI symbol trimming in legacy build configs
+          sed -i 's/check_defconfig//' build.config.gki* || true
+          sed -i 's/TRIM_NONLISTED_KMI=1/TRIM_NONLISTED_KMI=0/g' build.config.gki* || true
+          sed -i 's/KMI_SYMBOL_LIST_STRICT_MODE=1/KMI_SYMBOL_LIST_STRICT_MODE=0/g' build.config.gki* || true
+          # Names vary across GKI versions - strip the check from any build.config that still has it.
+          grep -rlZ 'check_defconfig' . --include='build.config*' 2>/dev/null | xargs -0r sed -i 's/check_defconfig//g' || true
+
+          # android16-6.12 GKI sets check_defconfig="minimized" in Kleaf's
+          # common_kernels.bzl. That makes the kernel_config step regenerate
+          # gki_defconfig with 'make savedefconfig' and demand the canonical,
+          # minimized form - which rejects the symbols we append here. Worse, the
+          # only way to "match" it is to regenerate the defconfig at config time,
+          # and with no Rust toolchain on PATH that silently drops CONFIG_RUST (and
+          # netfs), so Kleaf's module-list check later fails with rust_binder.ko /
+          # netfs.ko "unable to find". Flip that one literal to "disabled" - it is
+          # Kleaf's own off-switch (attr values: disabled|minimized|match) and the
+          # 6.12 equivalent of the legacy 'check_defconfig' strip above. It only
+          # relaxes the check, so it is safe on the android15-6.6 path too, and it
+          # leaves gki_defconfig (RUST on, full module set) exactly as we built it.
+          CK_BZL="../build/kernel/kleaf/common_kernels.bzl"
+          if [ -f "$CK_BZL" ] && grep -q '"minimized"' "$CK_BZL"; then
+            sed -i 's/else "minimized"/else "disabled"/g; s/: "minimized"/: "disabled"/g' "$CK_BZL"
+            if grep -q '"minimized"' "$CK_BZL"; then
+              echo "::warning::check_defconfig still 'minimized' in common_kernels.bzl; the defconfig check may still run"
+            else
+              echo "[+] check_defconfig minimized -> disabled (Kleaf defconfig check relaxed; defconfig/modules untouched)"
+            fi
+          else
+            echo "[i] no check_defconfig=\"minimized\" in common_kernels.bzl (older Kleaf) - nothing to relax"
+          fi
+
+          # Empty protected exports files in-place and disable strict KMI trimming (without deleting lines)
+          for f in android/abi_gki_protected_exports_*; do
+            [ -f "$f" ] && : > "$f"
+          done
+          for bzl in BUILD.bazel ../build/kernel/kleaf/common_kernels.bzl; do
+            if [ -f "$bzl" ]; then
+              sed -i 's/trim_nonlisted_kmi = True/trim_nonlisted_kmi = False/g' "$bzl" || true
+              sed -i 's/kmi_symbol_list_strict_mode = True/kmi_symbol_list_strict_mode = False/g' "$bzl" || true
+            fi
+          done
+
+
+      - name: Compile Kernel (${{ matrix.kernel_version }} - Auto Bazel / build.sh Dispatch)
+        shell: bash
+        run: |
+          cd kernel_workspace
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+
+          if [ "${{ matrix.build_tool }}" = "bazel" ] || { [ "${{ matrix.build_tool }}" = "auto" ] && [ -x tools/bazel ]; }; then
+            echo "[+] Building ${{ matrix.kernel_version }} with Kleaf / Bazel (page_size=${{ inputs.page_size }})..."
+            if [ "${{ inputs.page_size }}" = "16k" ] && grep -q "kernel_aarch64_16k_dist" common/BUILD.bazel 2>/dev/null; then
+              BAZEL_TARGET="//common:kernel_aarch64_16k_dist"
+            else
+              BAZEL_TARGET="//common:kernel_aarch64_dist"
+            fi
+            tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+          else
+            echo "[+] Building ${{ matrix.kernel_version }} with legacy build/build.sh + ccache..."
+            export CCACHE_DIR="$HOME/.cache/ccache"
+            export USE_CCACHE=1
+            ccache -M 12G || true
+            LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 DIST_DIR="$GITHUB_WORKSPACE/kernel_workspace/out/dist" build/build.sh
+          fi
+
+      - name: Build & Package Mosey wonder KSU Module (out-of-tree `.ko`)
+        id: mosey
+        if: ${{ inputs.mosey_mode != 'disabled' }}
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}/kernel_workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/mosey_src"
+          OBJ="$RUNNER_TEMP/mosey_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
+
+          # finished .config, Image and symvers, in either layout (bazel / build.sh)
+          cfg=""
+          for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do
+            [ -f "$c" ] && { cfg="$c"; break; }
+          done
+          [ -n "$cfg" ] || cfg="$(find bazel-bin/common out -maxdepth 4 -name .config -type f 2>/dev/null | head -n1 || true)"
+          img=""
+          for i in out/dist/Image bazel-bin/common/kernel_aarch64/Image; do
+            [ -f "$i" ] && { img="$i"; break; }
+          done
+          [ -n "$img" ] || img="$(find . -maxdepth 5 -type f -name Image 2>/dev/null | head -n1 || true)"
+          if [ -z "$cfg" ] || [ -z "$img" ]; then
+            echo "::warning::Mosey: no .config/Image found for this family, skipping module (kernel zip unaffected)"
+            exit 0
+          fi
+
+          # read the release from the Image so vermagic matches byte for byte
+          krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"
+          [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
+
+          # same prebuilt clang the kernel used (repo-synced under kernel_workspace)
+          clang_ver="$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null | head -n1 || true)"
+          clang_bin="$(sed -n 's/^CLANG_PREBUILT_BIN=//p' common/build.config.common 2>/dev/null | head -n1 || true)"
+          clang_bin="${clang_bin//\$\{CLANG_VERSION\}/$clang_ver}"
+          if [ ! -x "$clang_bin/clang" ] && [ -n "$clang_ver" ]; then
+            clang_bin="prebuilts/clang/host/linux-x86/clang-${clang_ver}/bin"
+          fi
+          if [ ! -x "$clang_bin/clang" ]; then
+            clang_bin="$(find prebuilts*/clang/host/linux-x86 -maxdepth 2 -path '*/clang-r*/bin' -type d 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$clang_bin" ] || [ ! -x "$clang_bin/clang" ]; then
+            echo "::warning::Mosey: no prebuilt clang found, skipping module (kernel zip unaffected)"
+            exit 0
+          fi
+          export PATH="$PWD/$clang_bin:$PATH"
+
+          cp "$cfg" "$OBJ/.config"
+          # 6.12 GKI has CONFIG_RUST=y; a C module never needs it and the runner
+          # has no matching rustc, so switch it off rather than let olddefconfig guess
+          [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
+
+          mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+              LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)")
+          "${mk[@]}" olddefconfig
+          "${mk[@]}" modules_prepare
+          echo "$krel" > "$OBJ/include/config/kernel.release"
+          printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
+
+          # vmlinux CRCs from the real build; cfg80211 symbols stay unversioned
+          # on purpose (they resolve against the phone's own cfg80211.ko)
+          sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
+          if [ -n "$sv" ]; then cp "$sv" "$OBJ/Module.symvers"; else echo "::warning::Mosey: no symvers, core symbols unversioned"; fi
+
+          "${mk[@]}" M="$SRC" KBUILD_MODPOST_WARN=1 modules
+          ko="$SRC/wonder_mosey_wild.ko"
+          llvm-strip --strip-debug "$ko" || true
+          vermagic="$(modinfo -F vermagic "$ko" 2>/dev/null || echo '?')"
+          echo "[+] built wonder_mosey_wild.ko  vermagic: $vermagic"
+          case "$vermagic" in
+            "$krel "*) ;;
+            *) echo "::warning::Mosey: vermagic '$vermagic' does not start with $krel" ;;
+          esac
+
+          # ---- package the module around the freshly-built .ko
+          # Preferred: bake the .ko into the full Mosey enabler committed at
+          # mosey/enabler/ (feelliao's userspace stack + our wonder-load.sh), so
+          # one flashable zip carries both halves. Fallback: a minimal module
+          # that only loads the wonder phy, for when the repo has no enabler.
+          ENABLER="$GITHUB_WORKSPACE/mosey/enabler"
+          PKG="$GITHUB_WORKSPACE/mosey_wonder/pkg"
+          rm -rf "$GITHUB_WORKSPACE/mosey_wonder"; mkdir -p "$PKG"
+          if [ -d "$ENABLER" ]; then
+            echo "[+] Baking wonder_mosey_wild.ko into the full Mosey enabler module"
+            cp -a "$ENABLER/." "$PKG/"
+            rm -f "$PKG/NOTICE-wonder.md"
+            MODNAME="Mosey-enabler"
+          else
+            echo "[+] No mosey/enabler in repo; shipping the minimal wonder loader module"
+            mkdir -p "$PKG/META-INF/com/google/android"
+            cat > "$PKG/module.prop" <<'PROP_EOF'
+          id=mosey_wonder
+          name=Mosey wonder phy
+          version=@KREL@
+          versionCode=@VCODE@
+          author=@Dev_DcS
+          description=Loads wonder_mosey_wild.ko so mosey-extended gets its 'wonder' phy. Only loads on the kernel it was built with: @KREL@
+          PROP_EOF
+            cat > "$PKG/post-fs-data.sh" <<'PFD_EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          LOG="$MODDIR/wonder.log"
+
+          [ -d /sys/module/wonder_mosey_wild ] && exit 0
+
+          (
+            i=0
+            while [ ! -d /sys/module/cfg80211 ] && [ "$i" -lt 120 ]; do
+              sleep 1
+              i=$((i + 1))
+            done
+            if [ ! -d /sys/module/cfg80211 ]; then
+              echo "cfg80211 never showed up after ${i}s, not loading" > "$LOG"
+              exit 0
+            fi
+            KO="$MODDIR/wonder_mosey_wild.ko"
+            if [ -s "$MODDIR/mac_addr" ]; then
+              set -- "$KO" "mac_addr=$(head -n1 "$MODDIR/mac_addr")"
+            else
+              set -- "$KO"
+            fi
+            if insmod "$@" > "$LOG" 2>&1; then
+              echo "loaded after ${i}s on $(uname -r)" >> "$LOG"
+            else
+              echo "insmod failed on $(uname -r), see dmesg | grep wonder" >> "$LOG"
+            fi
+          ) &
+          PFD_EOF
+            cat > "$PKG/customize.sh" <<'CUST_EOF'
+          BUILT_FOR="@KREL@"
+          RUNNING="$(uname -r)"
+
+          ui_print "- wonder_mosey_wild for $BUILT_FOR"
+          if [ "$RUNNING" != "$BUILT_FOR" ]; then
+            ui_print "! Running kernel is $RUNNING"
+            ui_print "! The module will very likely be refused until you"
+            ui_print "! flash the matching Wild kernel from the same run."
+          fi
+          if [ ! -d /sys/module/cfg80211 ]; then
+            ui_print "! cfg80211 isn't loaded right now. It normally comes"
+            ui_print "! with the Wi-Fi driver, the phy loads once it is."
+          fi
+          ui_print "- MAC: $(head -n1 "$MODPATH/mac_addr" 2>/dev/null)"
+          ui_print "  change it in /data/adb/modules/mosey_wonder/mac_addr"
+          CUST_EOF
+            cat > "$PKG/META-INF/com/google/android/update-binary" <<'UB_EOF'
+          #!/sbin/sh
+
+          umask 022
+
+          ui_print() { echo "$1"; }
+
+          # read by util_functions.sh's install_module
+          # shellcheck disable=SC2034
+          OUTFD=$2
+          # shellcheck disable=SC2034
+          ZIPFILE=$3
+
+          mount /data 2>/dev/null
+
+          if [ ! -f /data/adb/magisk/util_functions.sh ]; then
+            ui_print "Install this from the KernelSU or Magisk app."
+            exit 1
+          fi
+          . /data/adb/magisk/util_functions.sh
+          install_module
+          exit 0
+          UB_EOF
+            echo '#MAGISK' > "$PKG/META-INF/com/google/android/updater-script"
+            sed -i -e "s|@KREL@|$krel|g" -e "s|@VCODE@|${GITHUB_RUN_NUMBER}|g" "$PKG/module.prop" "$PKG/customize.sh"
+            MODNAME="Mosey-wonder"
+          fi
+
+          # drop in the kernel-specific .ko + chosen MAC; wonder-load.sh (shipped
+          # in the enabler) insmods it at boot, no-op if a native wonder phy exists
+          cp "$ko" "$PKG/wonder_mosey_wild.ko"
+          echo "${{ inputs.mosey_mac_addr }}" > "$PKG/mac_addr"
+          for s in post-fs-data.sh wonder-load.sh service.sh post-mount.sh boot-completed.sh                    customize.sh uninstall.sh action.sh mosey-control.sh                    META-INF/com/google/android/update-binary; do
+            [ -f "$PKG/$s" ] && chmod 0755 "$PKG/$s"
+          done
+
+          ZIP="$GITHUB_WORKSPACE/${krel}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-${MODNAME}.zip"
+          (cd "$PKG" && zip -qr9 "$ZIP" .)
+          echo "built=1" >> "$GITHUB_OUTPUT"
+          unzip -l "$ZIP" | tail -25
+
+      - name: Upload Mosey module
+        if: ${{ inputs.mosey_mode != 'disabled' && steps.mosey.outputs.built == '1' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey"
+          path: |
+            *-Mosey-enabler.zip
+            *-Mosey-wonder.zip
+          if-no-files-found: ignore
+
+      - name: Package Flashable AnyKernel3 Archive & BuildInfo
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git AnyKernel3 || \
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+
+          if [ -f kernel_workspace/out/dist/Image ]; then
+            cp -f kernel_workspace/out/dist/Image AnyKernel3/Image
+          elif [ -f kernel_workspace/bazel-bin/common/kernel_aarch64/Image ]; then
+            cp -f kernel_workspace/bazel-bin/common/kernel_aarch64/Image AnyKernel3/Image
+          else
+            FOUND_IMG=$(find kernel_workspace -type f -name "Image" | head -n 1 || true)
+            if [ -n "$FOUND_IMG" ]; then
+              cp -f "$FOUND_IMG" AnyKernel3/Image
+            fi
+          fi
+
+          if [ ! -f AnyKernel3/Image ]; then
+            echo "[-] Error: Compiled kernel Image not found!"
+            exit 1
+          fi
+
+          KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
+          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}-lts-${{ matrix.root_variant }}-Mosey-AnyKernel3.zip"
+          (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .)
+
+          cat << EOF > BuildInfo.txt
+          Kernel Family: ${{ matrix.kernel_version }}
+          Resolved Kernel Version: ${KVER_FULL}
+          Page Size: ${{ inputs.page_size }}
+          Manifest Branch: ${{ matrix.manifest_branch }}
+          SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
+          Root Implementation: FolkPatch (KernelPatch/APatch - kernel built stock; patch on-device with the FolkPatch app or use the CI-prepatched zip)
+          NoMount / TMPFS ACL: ${{ inputs.enable_nomount }}
+          Baseband Guard (BBG): ${{ (inputs.security_guards == 'bbg' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}
+          Networking Suite: ${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}
+          Extended BPF/BTF: ${{ inputs.enable_bpf }}
+          NTSync (/dev/ntsync): ${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}
+          DroidSpaces-OSS: ${{ inputs.enable_droidspaces }}
+          Mosey Extended Mode: ${{ inputs.mosey_mode }} (MAC: ${{ inputs.mosey_mac_addr }})
+          NLMON Capture: ${{ inputs.enable_nlmon }}
+          Module Check Bypass: ${{ inputs.allow_version_mismatch }}
+          EOF
+
+      - name: Upload AnyKernel3 ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey-AnyKernel3"
+          path: "*-AnyKernel3.zip"
+
+      - name: Upload BuildInfo & Mosey Companion Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey-BuildInfo"
+          path: |
+            BuildInfo.txt
+            mosey_out/*
+
+      - name: Fetch matching root manager APK (${{ matrix.root_variant }})
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p managers
+          # FolkPatch (KernelPatch/APatch) is NOT compiled into the kernel: the
+          # app patches the boot image on-device (or the CI-prepatch step below
+          # bakes it). Grab the FolkPatch manager APK so it ships in one place.
+          case "${{ matrix.root_variant }}" in
+            FinaSU)        MGR_REPO="LyraVoid/FinaSU" ;;
+            BakaSU)        MGR_REPO="Baka-SU/BakaSU" ;;
+            KernelSU-Next) MGR_REPO="KernelSU-Next/KernelSU-Next" ;;
+            KernelSU)      MGR_REPO="tiann/KernelSU" ;;
+            ReSukiSU)      MGR_REPO="ReSukiSU/ReSukiSU" ;;
+            KowSU)         MGR_REPO="KOWX712/KernelSU" ;;
+            NoRoot)        MGR_REPO="LyraVoid/FolkPatch" ;;
+            *)             MGR_REPO="" ;;
+          esac
+          if [ -z "$MGR_REPO" ]; then
+            echo "[i] ${{ matrix.root_variant }}: no manager app to fetch"
+            exit 0
+          fi
+          echo "[+] Fetching manager APK from $MGR_REPO (latest release)..."
+          if gh release download --repo "$MGR_REPO" --pattern '*.apk' --dir managers 2>/dev/null; then
+            echo "[+] manager APK(s): $(ls managers 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::no .apk in $MGR_REPO latest release (or repo unavailable); install the $MGR_REPO manager by hand"
+          fi
+
+      - name: Upload Root Manager APK
+        if: hashFiles('managers/*.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Manager"
+          path: managers/*.apk
+
+      - name: Fetch NoMount module
+        if: ${{ true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p nomount_out
+          echo "[+] Fetching NoMount module (maxsteeel/nomount, latest release)..."
+          if gh release download --repo maxsteeel/nomount --pattern '*.zip' --dir nomount_out 2>/dev/null; then
+            echo "[+] NoMount module(s): $(ls nomount_out 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::could not fetch the NoMount module (no zip asset or repo unavailable); install it by hand"
+          fi
+
+      - name: Upload NoMount module
+        if: ${{ hashFiles('nomount_out/*') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-NoMount"
+          path: nomount_out/*
+
+      - name: Build Re-Kernel module (out-of-tree, experimental, @Dev_DcS)
+        if: ${{ inputs.enable_rekernel == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd kernel_workspace
+          REK_SRC="$GITHUB_WORKSPACE/sources/rekernel/LKM-Source"
+          LOADER="$GITHUB_WORKSPACE/sources/rekernel/loader"
+          if [ ! -f "$REK_SRC/Makefile" ]; then echo "::warning::Re-Kernel: vendored source missing, skipping (kernel zip unaffected)"; exit 0; fi
+          OBJ="$RUNNER_TEMP/rek_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
+          REK="$GITHUB_WORKSPACE/rekernel_build"; rm -rf "$REK"; mkdir -p "$REK"; cp -a "$REK_SRC/." "$REK/"
+          cfg=""; for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do [ -f "$c" ] && cfg="$c" && break; done
+          [ -n "$cfg" ] || cfg="$(find . -maxdepth 5 -type f -name .config 2>/dev/null | head -n1 || true)"
+          img=""; for i in out/dist/Image bazel-bin/common/kernel_aarch64/Image; do [ -f "$i" ] && img="$i" && break; done
+          [ -n "$img" ] || img="$(find . -maxdepth 5 -type f -name Image 2>/dev/null | head -n1 || true)"
+          if [ -z "$cfg" ] || [ -z "$img" ]; then echo "::warning::Re-Kernel: no .config/Image, skipping (kernel zip unaffected)"; exit 0; fi
+          krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"; [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
+          clang_ver="$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null | head -n1 || true)"
+          clang_bin="$(sed -n 's/^CLANG_PREBUILT_BIN=//p' common/build.config.common 2>/dev/null | head -n1 || true)"
+          clang_bin="${clang_bin//\$\{CLANG_VERSION\}/$clang_ver}"
+          [ -x "$clang_bin/clang" ] || clang_bin="prebuilts/clang/host/linux-x86/clang-${clang_ver}/bin"
+          [ -x "$clang_bin/clang" ] || clang_bin="$(find prebuilts*/clang/host/linux-x86 -maxdepth 2 -path '*/clang-r*/bin' -type d 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$clang_bin" ] || [ ! -x "$clang_bin/clang" ]; then echo "::warning::Re-Kernel: no prebuilt clang, skipping"; exit 0; fi
+          export PATH="$PWD/$clang_bin:$PATH"
+          cp "$cfg" "$OBJ/.config"
+          [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
+          mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)")
+          "${mk[@]}" olddefconfig || { echo "::warning::Re-Kernel: olddefconfig failed, skipping"; exit 0; }
+          "${mk[@]}" modules_prepare || { echo "::warning::Re-Kernel: modules_prepare failed, skipping"; exit 0; }
+          echo "$krel" > "$OBJ/include/config/kernel.release"
+          printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
+          sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
+          [ -n "$sv" ] && cp "$sv" "$OBJ/Module.symvers" || echo "::warning::Re-Kernel: no symvers, core symbols unversioned"
+          if ! "${mk[@]}" M="$REK" KBUILD_MODPOST_WARN=1 modules; then echo "::warning::Re-Kernel: module build failed (vendor-hook mismatch on this KMI?); skipping, kernel zip unaffected"; exit 0; fi
+          ko="$(find "$REK" -name 'rekernel*.ko' -type f | head -n1 || true)"
+          [ -n "$ko" ] || { echo "::warning::Re-Kernel: no .ko produced, skipping"; exit 0; }
+          llvm-strip --strip-debug "$ko" 2>/dev/null || true
+          echo "[+] built $(basename "$ko")  vermagic: $(modinfo -F vermagic "$ko" 2>/dev/null || echo '?')"
+          PKG="$GITHUB_WORKSPACE/rekernel_pkg"; rm -rf "$PKG"; mkdir -p "$PKG"
+          cp -a "$LOADER/." "$PKG/"
+          cp "$ko" "$PKG/rekernel-${krel}.ko"
+          sed -i "s|@KREL@|${krel}|g; s|@VC@|$(date +%Y%m%d)|g" "$PKG/module.prop.in"
+          mv "$PKG/module.prop.in" "$PKG/module.prop"
+          ZIP="$GITHUB_WORKSPACE/Re-Kernel-${krel}-DevDcS.zip"
+          (cd "$PKG" && zip -rqX "$ZIP" .)
+          echo "[+] packaged $(basename "$ZIP")"
+
+      - name: Upload Re-Kernel module
+        if: ${{ inputs.enable_rekernel == 'true' && hashFiles('Re-Kernel-*-DevDcS.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-Re-Kernel"
+          path: Re-Kernel-*-DevDcS.zip
+
+      - name: Fetch & bundle Integrity Tools (Integrity_Tools.zip)
+        if: ${{ inputs.integrity_bundle == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          chmod +x scripts/fetch_integrity_tools.sh 2>/dev/null || true
+          if ! bash scripts/fetch_integrity_tools.sh "$GITHUB_WORKSPACE/Integrity_Tools" "$GITHUB_WORKSPACE"; then
+            echo "::warning::Integrity tools fetch failed (kernel zip unaffected)"; exit 0
+          fi
+          cd "$GITHUB_WORKSPACE"
+          rm -f Integrity_Tools.zip
+          zip -rqX Integrity_Tools.zip Integrity_Tools || true
+
+      - name: Upload Integrity_Tools.zip
+        if: ${{ inputs.integrity_bundle == 'true' && hashFiles('Integrity_Tools.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Integrity_Tools
+          path: Integrity_Tools.zip
+
+      - name: Setup Zig (only when building the XEChide KPM)
+        if: ${{ inputs.ci_prepatch == 'true' && inputs.hide_kpm == 'xechide' }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: FolkPatch - CI-prepatch kernel + embed KPMs (NoMount / slot-#2 / selinux_maf) (@Dev_DcS)
+        if: ${{ inputs.ci_prepatch == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd kernel_workspace
+          IMG="AnyKernel3/Image"
+          if [ ! -f "$IMG" ]; then echo "::warning::FolkPatch: no AnyKernel3/Image, skipping prepatch (stock zip unaffected)"; exit 0; fi
+
+          # SuperKey: user-supplied or a random 16-hex key. Root-equivalent, so it
+          # is written to FolkPatch-prepatched.txt (uploaded) rather than hidden.
+          SKEY="${{ inputs.superkey }}"
+          if [ -z "$SKEY" ]; then SKEY="$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16)"; fi
+          echo "[+] FolkPatch superkey: $SKEY"
+
+          # Build kptools (host) + kpimg (arm64) straight from FolkPatch's own
+          # KernelPatch base, so the baked image matches the FolkPatch manager.
+          KP="$RUNNER_TEMP/kernelpatch"; rm -rf "$KP"
+          if ! git clone --depth=1 https://github.com/LyraVoid/KernelPatch "$KP"; then
+            echo "::warning::FolkPatch: KernelPatch clone failed, skipping prepatch"; exit 0
+          fi
+          # kptools: a plain host-linux binary (make, else cmake).
+          if ! make -C "$KP/tools" >/dev/null 2>&1; then
+            ( cd "$KP/tools" && rm -rf build && mkdir -p build && cd build \
+                && cmake .. >/dev/null 2>&1 && cmake --build . >/dev/null 2>&1 ) || true
+          fi
+          KPTOOLS="$(find "$KP/tools" -maxdepth 3 -type f -name kptools -perm -u+x 2>/dev/null | head -n1 || true)"
+          if [ -z "$KPTOOLS" ]; then echo "::warning::FolkPatch: kptools build failed, skipping prepatch"; exit 0; fi
+
+          # kpimg: freestanding arm64 payload. Needs a GNU aarch64 toolchain; the
+          # runner usually has it or can add it (best-effort).
+          command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || sudo apt-get install -y gcc-aarch64-linux-gnu >/dev/null 2>&1 || true
+          if ! make -C "$KP/kernel" TARGET_COMPILE=aarch64-linux-gnu- >/dev/null 2>&1; then
+            make -C "$KP/kernel" >/dev/null 2>&1 || true
+          fi
+          KPIMG="$(find "$KP/kernel" -maxdepth 2 -type f -name 'kpimg*' ! -name '*.lds' 2>/dev/null | head -n1 || true)"
+          if [ -z "$KPIMG" ]; then echo "::warning::FolkPatch: kpimg build failed (no aarch64 toolchain?), skipping prepatch"; exit 0; fi
+
+          # Compiler for building KPMs against OUR KernelPatch ($KP) = best ABI
+          # match to the kpimg just built. AOSP clang (the kernel's own) first,
+          # cross-gcc as fallback.
+          CL="$(find prebuilts*/clang/host/linux-x86 -maxdepth 2 -path '*/clang-r*/bin' -type d 2>/dev/null | sort -V | tail -n1 || true)"
+          CLANG=""; [ -n "$CL" ] && [ -x "$PWD/$CL/clang" ] && CLANG="$PWD/$CL/clang"
+          command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || sudo apt-get install -y gcc-aarch64-linux-gnu >/dev/null 2>&1 || true
+          mkdir -p "$RUNNER_TEMP/kpms" "$GITHUB_WORKSPACE/folkpatch_companions"
+          kpm_have() { ls "$RUNNER_TEMP/kpms/"*.kpm 2>/dev/null | grep -qiE "$1"; }
+
+          # 0) Vendored KPMs are AUTHORITATIVE. Drop any .kpm into sources/kpms/ and
+          #    it is embedded verbatim - the way to pin an exact version or a closed
+          #    (EULA) module, e.g. your own selinux_magisk_access_filter v1.1.6.1.
+          if ls "$GITHUB_WORKSPACE/sources/kpms/"*.kpm >/dev/null 2>&1; then
+            cp "$GITHUB_WORKSPACE/sources/kpms/"*.kpm "$RUNNER_TEMP/kpms/"
+            echo "[+] vendored KPMs: $(ls "$GITHUB_WORKSPACE/sources/kpms/"*.kpm | xargs -n1 basename | tr '\n' ' ')"
+          fi
+
+          # 1) NoMount (lzghzr/APatch_kpm) - mount-free VFS injection, no mount
+          #    traces. Public dynamic/BTF prebuilt. Skipped if you vendored NoMount.
+          if ! kpm_have 'nomount'; then
+            gh release download --repo lzghzr/APatch_kpm --pattern 'NoMount.kpm' --dir "$RUNNER_TEMP/kpms" 2>/dev/null \
+              && echo "[+] NoMount.kpm fetched" \
+              || echo "::warning::FolkPatch: NoMount.kpm not fetched (lzghzr/APatch_kpm); vendor it under sources/kpms/"
+          fi
+          gh release download --repo lzghzr/APatch_kpm --pattern 'NoMount-kpm.zip' --dir "$GITHUB_WORKSPACE/folkpatch_companions" 2>/dev/null \
+            || echo "::warning::FolkPatch: NoMount companion zip not fetched - grab it from lzghzr/APatch_kpm releases"
+
+          # 2) Slot #2 hide KPM (BreZygisk-safe, NOT NoHello) - your hide_kpm choice.
+          case "${{ inputs.hide_kpm }}" in
+            xechide)
+              # byBOOK10086/XEChide - kernel app hiding (LSM path + binder filter),
+              # no userspace injection. Builds with Zig against our KP headers.
+              XE="$RUNNER_TEMP/xechide"; rm -rf "$XE"
+              if command -v zig >/dev/null 2>&1 && git clone --depth=1 https://github.com/byBOOK10086/XEChide "$XE" 2>/dev/null; then
+                KP_SRC="$KP" bash "$XE/kpm/build.sh" >/dev/null 2>&1 && [ -f "$XE/kpm/out/xechide.kpm" ] \
+                  && { cp "$XE/kpm/out/xechide.kpm" "$RUNNER_TEMP/kpms/"; echo "[+] xechide.kpm built"; } \
+                  || echo "::warning::FolkPatch: XEChide build failed - vendor your xechide.kpm under sources/kpms/"
+              else
+                echo "::warning::FolkPatch: zig/XEChide unavailable - vendor your xechide.kpm under sources/kpms/"
+              fi
+              ;;
+            hide_env)
+              # klcok/kpm-hide-env - kernel root-environment hiding. gcc + our KP;
+              # repo ships a prebuilt .kpm as an automatic fallback.
+              HD="$RUNNER_TEMP/hide_env"; rm -rf "$HD"
+              if git clone --depth=1 https://github.com/klcok/kpm-hide-env "$HD" 2>/dev/null; then
+                make -C "$HD" TARGET_COMPILE=aarch64-linux-gnu- KP_DIR="$KP" >/dev/null 2>&1 || true
+                HKPM="$(find "$HD" -maxdepth 1 -name 'hide_env*.kpm' 2>/dev/null | sort | head -n1 || true)"
+                [ -n "$HKPM" ] && { cp "$HKPM" "$RUNNER_TEMP/kpms/hide_env.kpm"; echo "[+] hide_env.kpm ready"; } \
+                  || echo "::warning::FolkPatch: hide_env KPM unavailable - vendor it under sources/kpms/"
+                for z in "$HD"/hide_env-kpm.zip "$HD"/hide_env_v*.zip; do [ -f "$z" ] && { cp "$z" "$GITHUB_WORKSPACE/folkpatch_companions/"; break; }; done
+              else
+                echo "::warning::FolkPatch: kpm-hide-env clone failed - vendor hide_env.kpm under sources/kpms/"
+              fi
+              ;;
+            *) echo "[i] slot #2 hide KPM: none" ;;
+          esac
+
+          # 3) selinux_magisk_access_filter (Admirepowered/selinux_hook) - rejects
+          #    Magisk /sys/fs/selinux/access probes; in-kernel AVC untouched. GPL,
+          #    built against OUR KP. Vendor your exact v1.1.6.1 to pin it instead.
+          if ! kpm_have 'selinux'; then
+            SH="$RUNNER_TEMP/selinux_hook"; rm -rf "$SH"
+            if git clone --depth=1 https://github.com/Admirepowered/selinux_hook "$SH" 2>/dev/null; then
+              BD="$SH"; [ -d "$SH/selinux_hook" ] && BD="$SH/selinux_hook"
+              built=""
+              if [ -n "$CLANG" ]; then make -C "$BD" CC="$CLANG --target=aarch64-linux-android33" KP_DIR="$KP" >/dev/null 2>&1 && built=1; fi
+              [ -n "$built" ] || { make -C "$BD" TARGET_COMPILE=aarch64-linux-gnu- KP_DIR="$KP" >/dev/null 2>&1 && built=1; }
+              shk="$(find "$BD" -maxdepth 1 -name '*.kpm' 2>/dev/null | head -n1 || true)"
+              [ -n "$shk" ] && { cp "$shk" "$RUNNER_TEMP/kpms/selinux_magisk_access_filter.kpm"; echo "[+] selinux_magisk_access_filter.kpm built"; } \
+                || echo "::warning::FolkPatch: selinux_hook build failed - vendor your selinux_magisk_access_filter.kpm under sources/kpms/"
+            else
+              echo "::warning::FolkPatch: selinux_hook clone failed - vendor selinux_magisk_access_filter.kpm under sources/kpms/"
+            fi
+          fi
+
+          # 4) Optional: SUSFS-as-KPM (auto best-effort; only if vendored under
+          #    sources/susfs-kpm - no published susfs .kpm exists).
+          SKD="$GITHUB_WORKSPACE/sources/susfs-kpm"
+          if [ -f "$SKD/Makefile" ]; then
+            make -C "$SKD" TARGET_COMPILE=aarch64-linux-gnu- KP_DIR="$KP" >/dev/null 2>&1 \
+              && find "$SKD" -name '*.kpm' -exec cp {} "$RUNNER_TEMP/kpms/" \; 2>/dev/null \
+              && echo "[+] built SUSFS KPM" \
+              || echo "::warning::FolkPatch: SUSFS KPM build failed"
+          fi
+
+          # Embed every KPM we gathered (auto-load at boot via kptools -M).
+          KPM_ARGS=()
+          while IFS= read -r kpm; do
+            [ -n "$kpm" ] || continue
+            nm="$(basename "$kpm" .kpm)"
+            KPM_ARGS+=( -M "$kpm" -T kpm -N "$nm" -V load -A "" )
+            echo "[+] embedding KPM: $nm"
+          done < <(find "$RUNNER_TEMP/kpms" -type f -name '*.kpm' 2>/dev/null)
+          [ "${#KPM_ARGS[@]}" -gt 0 ] || echo "::warning::FolkPatch: no KPMs embedded (all sources failed); baking root only"
+
+          # Patch the Image in place (KernelPatch payload + superkey + KPMs), then
+          # repackage AnyKernel3 as a second, clearly-named zip.
+          if "$KPTOOLS" -p -i "$IMG" -S "$SKEY" -k "$KPIMG" "${KPM_ARGS[@]}" -o "$RUNNER_TEMP/Image.kp"; then
+            cp "$RUNNER_TEMP/Image.kp" AnyKernel3/Image
+            KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
+            ZIP="$GITHUB_WORKSPACE/${KVER_FULL}-${{ matrix.kernel_version }}-FolkPatch-prepatched-AnyKernel3.zip"
+            ( cd AnyKernel3 && zip -r9 "$ZIP" . )
+            {
+              echo "FolkPatch CI-prepatched kernel (@Dev_DcS)"
+              echo "KernelPatch: LyraVoid/KernelPatch (built in CI)"
+              echo "SuperKey: $SKEY"
+              echo "Embedded KPMs: $(ls "$RUNNER_TEMP/kpms"/*.kpm 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
+              echo "Also flash (folkpatch_companions/): $(ls "$GITHUB_WORKSPACE/folkpatch_companions" 2>/dev/null | tr '\n' ' ')"
+              echo "NOTE: experimental - verify the FolkPatch app accepts this image; if boot fails, flash the stock zip and patch on-device instead. NoMount/hide_env also need their companion zip flashed to do anything."
+            } > "$GITHUB_WORKSPACE/FolkPatch-prepatched.txt"
+            echo "[+] FolkPatch-prepatched zip: $(basename "$ZIP")"
+          else
+            echo "::warning::FolkPatch: kptools patch failed (kpimg/ABI mismatch?); stock zip unaffected"
+          fi
+
+      - name: Upload FolkPatch-prepatched kernel
+        if: ${{ inputs.ci_prepatch == 'true' && hashFiles('*-FolkPatch-prepatched-AnyKernel3.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-FolkPatch-prepatched"
+          path: |
+            *-FolkPatch-prepatched-AnyKernel3.zip
+            FolkPatch-prepatched.txt
+            folkpatch_companions/*
