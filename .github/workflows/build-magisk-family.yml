@@ -1,0 +1,233 @@
+name: Build Magisk Family for Pixel 8-11 (init_boot.img patch)
+
+# Magisk-family pipeline (@Dev_DcS). Unlike the KernelSU / APatch families this
+# one doesn't compile a kernel - Magisk is systemless and lives in the ramdisk,
+# which on Pixel 8-11 sits in init_boot.img (NOT boot.img). So the job here is:
+# grab the stock init_boot, patch it headless with the chosen fork's magiskboot
+# + boot_patch.sh, and hand back a flashable init_boot. Build the matching stock
+# kernel with one of the other workflows if you want both.
+#
+# Boot source order: a vendored image under Construction_Site/Orange_Cone/<gen>/
+# wins; otherwise point boot_image_url at a factory or OTA zip and it's pulled +
+# unpacked on the runner.
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      magisk_fork:
+        description: "Magisk fork (drives which magiskboot + boot_patch.sh + manager APK is used). Alpha/Graphene/WeaveMask APK layouts drift, so this step is best-effort - vendor the APK if a fetch misses."
+        type: choice
+        options:
+          - Magisk
+          - Magisk-Alpha
+          - GrapheneOS
+          - WeaveMask
+        default: Magisk
+
+      android_gen:
+        description: "Android generation - picks the Construction_Site/Orange_Cone/<gen>/ folder your stock init_boot.img lives in."
+        type: choice
+        options:
+          - A17
+          - A16
+        default: A17
+
+      device_codename:
+        description: "Device codename (names the output; mustang = Pixel 10 Pro XL)."
+        type: string
+        default: "mustang"
+
+      boot_image_url:
+        description: "Fallback only: direct URL to a Google factory or OTA zip. Used when no init_boot.img is vendored under Orange_Cone/<gen>/. OTA (payload.bin) and factory (image-*.zip) are both handled."
+        type: string
+        default: ""
+
+      preinit_device:
+        description: "PREINITDEVICE for boot_patch.sh (preinit partition, e.g. 'metadata' on Pixel). Blank = let Magisk decide."
+        type: string
+        default: ""
+
+      keepverity:
+        description: "KEEPVERITY (keep dm-verity; true is correct for an unlocked Pixel that still wants verified boot structure)."
+        type: boolean
+        default: true
+
+      keepforceencrypt:
+        description: "KEEPFORCEENCRYPT (keep forced encryption)."
+        type: boolean
+        default: true
+
+      patch_vbmeta_flag:
+        description: "PATCHVBMETAFLAG (patch out vbmeta flags in the image itself; usually false - handle vbmeta separately with avbroot/fastboot)."
+        type: boolean
+        default: false
+
+      release_type:
+        description: "Release Type"
+        type: choice
+        options:
+          - CI
+          - Release
+        default: CI
+
+jobs:
+  patch-init-boot:
+    name: "Patch init_boot (${{ inputs.magisk_fork }} | ${{ inputs.android_gen }} | ${{ inputs.device_codename }})"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install host tooling
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip curl file >/dev/null
+
+      - name: Resolve stock init_boot.img
+        id: resolve-boot
+        shell: bash
+        run: |
+          set -euo pipefail
+          GEN="${{ inputs.android_gen }}"
+          OUT="$GITHUB_WORKSPACE/boot_src"; mkdir -p "$OUT"
+
+          # 1) Vendored image wins. Check a couple of sensible locations.
+          VENDORED=""
+          for p in \
+            "Construction_Site/Orange_Cone/$GEN/init_boot.img" \
+            "Construction_Site/Orange_Cone/$GEN/init_boot" \
+            "sources/boot/$GEN/init_boot.img"; do
+            if [ -f "$p" ]; then VENDORED="$p"; break; fi
+          done
+
+          if [ -n "$VENDORED" ]; then
+            cp -f "$VENDORED" "$OUT/init_boot.img"
+            echo "[+] Using vendored init_boot: $VENDORED"
+          elif [ -n "${{ inputs.boot_image_url }}" ]; then
+            echo "[+] No vendored image; pulling ${{ inputs.boot_image_url }}"
+            curl -LSs "${{ inputs.boot_image_url }}" -o "$OUT/src.zip"
+            cd "$OUT"
+            if unzip -l src.zip | grep -q 'payload\.bin'; then
+              echo "[+] OTA payload detected - extracting init_boot with payload-dumper-go"
+              PDG="https://github.com/ssut/payload-dumper-go/releases/latest/download/payload-dumper-go_$(uname -s)_$(uname -m).tar.gz"
+              curl -LSs "$PDG" -o pdg.tgz && tar xzf pdg.tgz || true
+              unzip -o src.zip payload.bin >/dev/null
+              ./payload-dumper-go -p init_boot -o . payload.bin
+            else
+              echo "[+] Factory zip detected - unpacking inner image-*.zip"
+              INNER="$(unzip -Z1 src.zip | grep -E 'image-.*\.zip' | head -n1)"
+              [ -n "$INNER" ] && unzip -o src.zip "$INNER" >/dev/null && unzip -o "$INNER" init_boot.img >/dev/null
+            fi
+            [ -f init_boot.img ] || { echo "::error::could not extract init_boot.img from the supplied zip"; exit 1; }
+          else
+            echo "::error::No init_boot.img found. Vendor one under Construction_Site/Orange_Cone/$GEN/ or set boot_image_url."
+            exit 1
+          fi
+
+          echo "[+] init_boot.img: $(file -b "$OUT/init_boot.img" 2>/dev/null || echo unknown), $(stat -c%s "$OUT/init_boot.img") bytes"
+
+      - name: Fetch ${{ inputs.magisk_fork }} APK
+        id: fetch-magisk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/magisk_apk_dl"
+          cd "$GITHUB_WORKSPACE/magisk_apk_dl"
+
+          # Each fork publishes its manager APK (which carries magiskboot +
+          # boot_patch.sh) on GitHub releases. Pattern-match loosely; fall back
+          # to the newest .apk asset.
+          case "${{ inputs.magisk_fork }}" in
+            Magisk)       REPO="topjohnwu/Magisk" ;;
+            Magisk-Alpha) REPO="vvb2060/magisk_files" ;;
+            GrapheneOS)   REPO="pixincreate/Magisk" ;;
+            WeaveMask)    REPO="Seyud/WeaveMask" ;;
+          esac
+          echo "fork_repo=$REPO" >> "$GITHUB_OUTPUT"
+
+          gh release download --repo "$REPO" --pattern '*.apk' --dir . 2>/dev/null \
+            || gh release download --repo "$REPO" --pattern '*.zip' --dir . 2>/dev/null \
+            || echo "::warning::no release asset auto-fetched from $REPO - vendor the APK under magisk_apk_dl/ if the next step can't find one"
+
+          APK="$(ls -S *.apk *.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$APK" ] || { echo "::error::no $REPO APK/zip available to patch with"; exit 1; }
+          echo "[+] Using $APK"
+          echo "apk_path=$GITHUB_WORKSPACE/magisk_apk_dl/$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Patch init_boot.img (headless magiskboot)
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$GITHUB_WORKSPACE/patch"; rm -rf "$WORK"; mkdir -p "$WORK/apk"
+          unzip -oq "${{ steps.fetch-magisk.outputs.apk_path }}" -d "$WORK/apk"
+          cd "$WORK"
+
+          # Host magiskboot (the runner is x86_64). Fall back to x86 if needed.
+          BOOT_SO="$(ls apk/lib/x86_64/libmagiskboot.so apk/lib/x86/libmagiskboot.so 2>/dev/null | head -n1 || true)"
+          [ -n "$BOOT_SO" ] || { echo "::error::libmagiskboot.so not in the APK (layout changed?) - this fork needs hand-patching"; exit 1; }
+          cp "$BOOT_SO" ./magiskboot && chmod +x magiskboot
+
+          # arm64 payload binaries + assets that boot_patch.sh bakes into the
+          # ramdisk. Names drift across versions, so copy whatever's present.
+          A64="apk/lib/arm64-v8a"
+          cp "$A64/libmagiskinit.so"  ./magiskinit  2>/dev/null || true
+          cp "$A64/libmagisk64.so"    ./magisk64    2>/dev/null || cp "$A64/libmagisk.so" ./magisk64 2>/dev/null || true
+          cp apk/lib/armeabi-v7a/libmagisk32.so ./magisk32 2>/dev/null || true
+          cp apk/assets/stub.apk ./stub.apk 2>/dev/null || true
+          cp apk/assets/boot_patch.sh ./boot_patch.sh 2>/dev/null || true
+          [ -f boot_patch.sh ] || { echo "::error::boot_patch.sh not in the APK assets - fork too old/new for headless patching"; exit 1; }
+
+          cp "$GITHUB_WORKSPACE/boot_src/init_boot.img" ./init_boot.img
+
+          PV="$([ '${{ inputs.patch_vbmeta_flag }}' = 'true' ] && echo true || echo false)"
+          echo "[+] Patching with KEEPVERITY=${{ inputs.keepverity }} KEEPFORCEENCRYPT=${{ inputs.keepforceencrypt }} PATCHVBMETAFLAG=$PV PREINITDEVICE='${{ inputs.preinit_device }}'"
+          KEEPVERITY=${{ inputs.keepverity }} \
+          KEEPFORCEENCRYPT=${{ inputs.keepforceencrypt }} \
+          PATCHVBMETAFLAG=$PV \
+          PREINITDEVICE="${{ inputs.preinit_device }}" \
+            sh ./boot_patch.sh init_boot.img
+
+          [ -f new-boot.img ] || { echo "::error::boot_patch.sh produced no new-boot.img"; exit 1; }
+          OUTNAME="${{ inputs.device_codename }}-${{ inputs.android_gen }}-${{ inputs.magisk_fork }}-init_boot-patched.img"
+          cp -f new-boot.img "$GITHUB_WORKSPACE/$OUTNAME"
+          echo "out_name=$OUTNAME" >> "$GITHUB_OUTPUT"
+          echo "[+] Patched image: $OUTNAME ($(stat -c%s "$GITHUB_WORKSPACE/$OUTNAME") bytes)"
+
+      - name: Write flash note
+        shell: bash
+        run: |
+          cat > "$GITHUB_WORKSPACE/FLASH-README.txt" << EOF
+          ${{ steps.patch.outputs.out_name }}
+          Fork: ${{ inputs.magisk_fork }} (${{ steps.fetch-magisk.outputs.fork_repo }})
+          Device: ${{ inputs.device_codename }} (${{ inputs.android_gen }})
+
+          Flash (bootloader unlocked):
+            fastboot flash init_boot ${{ steps.patch.outputs.out_name }}
+          or boot once to test:
+            fastboot boot ${{ steps.patch.outputs.out_name }}
+
+          Then open the ${{ inputs.magisk_fork }} manager and let it finish setup.
+          Signed: @Dev_DcS
+          EOF
+
+      - name: Upload patched init_boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.device_codename }}-${{ inputs.android_gen }}-${{ inputs.magisk_fork }}-init_boot"
+          path: |
+            ${{ steps.patch.outputs.out_name }}
+            FLASH-README.txt
+
+      - name: Upload matching manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.device_codename }}-${{ inputs.magisk_fork }}-Manager"
+          path: ${{ steps.fetch-magisk.outputs.apk_path }}

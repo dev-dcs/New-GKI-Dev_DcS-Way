@@ -18,11 +18,11 @@ on:
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "Specific LTS Subversion - pinned to 6.6.144 for Pixel 10 (mustang); change only if your device moved to a newer 6.6 LTS"
+        description: "LTS sublevel: 'LTS' (latest pinned per family) or the last digits only, e.g. 162"
         type: string
-        default: "6.6.144"
+        default: "LTS"
       kernel_name:
-        description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
+        description: "Custom kernel name for uname (e.g. Dev_DcS). Letters/digits/._- only. Blank = stock."
         type: string
         default: ""
       page_size:
@@ -48,7 +48,7 @@ on:
           - Release
         default: CI
       use_cache:
-        description: "Use ccache (5.10/5.15) & Bazel cache (5.15+/6.x) (restore/save)"
+        description: "Use ccache & Bazel cache (restore/save)"
         type: boolean
         default: true
       allow_version_mismatch:
@@ -61,19 +61,14 @@ on:
         description: "Enable SUSFS (FinaSU integrates it natively; leave ON for integrity hiding)"
         type: boolean
         default: true
+      hide_shell_su:
+        description: "Mask the shell->su SELinux transition from app probes (CONFIG_SELINUX_HIDE_SHELL_SU_TRANS). Needs the hide_shell_su.c/.h patch in-tree - inert without it. Defeats checkSELinuxAccess-style root detectors; leave ON for a hardened daily driver."
+        type: boolean
+        default: true
       enable_nomount:
         description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
         type: boolean
         default: true
-      security_guards:
-        description: "Partition guards: 'bbg' (default) = Baseband-Guard only; 'bbg+nv' also blocks writes to the modem's irreplaceable nv_protected.bin (RF-cal/IMEI); 'nv' = NV guard only; 'none' = neither. See README before using NV."
-        type: choice
-        options:
-          - bbg
-          - bbg+nv
-          - nv
-          - none
-        default: bbg
       security_patches:
         description: "Security patch level: monthly = latest tagged GKI/LTS (Google monthly, tested); latest-cve = also apply post-release stable CVE fixes on top (bleeding edge, may skip on conflict - READ THE README WARNING); none = base as pinned"
         type: choice
@@ -142,7 +137,7 @@ on:
 
 jobs:
   # ============================================================================
-  # JOB 1: Generate Multi-Version Build Matrix (5.10 -> 6.12 + Root Variants)
+  # JOB 1: Resolve build matrix (6.1 / 6.6 / 6.12, FinaSU)
   # ============================================================================
   generate-matrix:
     name: "Resolve Kernel & Root Matrix"
@@ -164,58 +159,35 @@ jobs:
 
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
-          req_root = "FinaSU"
+
+          # Latest pinned LTS sublevel per family (bump as upstream moves)
+          LTS_PIN = {"6.1": "192", "6.6": "162", "6.12": "117"}
 
           all_families = [
-              {
-                  "kernel_version": "android14-6.1",
-                  "kver": "6.1",
-                  "manifest_branch": "common-android14-6.1-lts",
-                  "susfs_branch": "gki-android14-6.1",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android15-6.6",
-                  "kver": "6.6",
-                  "manifest_branch": "common-android15-6.6-lts",
-                  "susfs_branch": "gki-android15-6.6",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android16-6.12",
-                  "kver": "6.12",
-                  "manifest_branch": "common-android16-6.12-lts",
-                  "susfs_branch": "gki-android16-6.12",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
+              {"kernel_version": "android14-6.1",  "kver": "6.1",  "manifest_branch": "common-android14-6.1-lts",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android15-6.6",  "kver": "6.6",  "manifest_branch": "common-android15-6.6-lts",  "susfs_branch": "gki-android15-6.6",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android16-6.12", "kver": "6.12", "manifest_branch": "common-android16-6.12-lts", "susfs_branch": "gki-android16-6.12", "cache_type": "bazel", "build_tool": "bazel"},
           ]
 
-          if req_family == "all":
-              selected_families = all_families
-          else:
-              selected_families = [f for f in all_families if f["kernel_version"] == req_family]
+          selected = all_families if req_family == "all" else [f for f in all_families if f["kernel_version"] == req_family]
 
-          if req_root == "All":
-              roots = ["KernelSU-Next", "KernelSU", "BakaSU"]
-          else:
-              roots = [req_root]
+          def sublevel(fam):
+              # 'LTS' or blank -> pinned sublevel; bare digits -> use as-is;
+              # a full x.y.z matching this family -> its last field.
+              if not req_lts or req_lts.upper() == "LTS":
+                  return LTS_PIN[fam["kver"]]
+              if req_lts.isdigit():
+                  return req_lts
+              if req_lts.startswith(fam["kver"] + "."):
+                  return req_lts.split(".")[-1]
+              return LTS_PIN[fam["kver"]]
 
           include = []
-          for fam in selected_families:
-              lts_val = "lts"
-              if req_lts:
-                  if req_lts.startswith(fam["kver"] + "."):
-                      lts_val = req_lts
-                  elif req_family != "all":
-                      lts_val = req_lts
-              for r in roots:
-                  entry = dict(fam)
-                  entry["lts_version"] = lts_val
-                  entry["root_variant"] = r
-                  include.append(entry)
+          for fam in selected:
+              entry = dict(fam)
+              entry["lts_version"] = f'{fam["kver"]}.{sublevel(fam)}'  # full, e.g. 6.6.162
+              entry["root_variant"] = "FinaSU"
+              include.append(entry)
 
           matrix_json = json.dumps({"include": include})
           print("Generated matrix:", matrix_json)
@@ -296,7 +268,7 @@ jobs:
           allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
 
   # ============================================================================
-  # JOB 3: Standalone Multi-Version Builder (5.10, 5.15, 6.1, 6.6, 6.12 + Mosey)
+  # JOB 3: Standalone builder (6.1 / 6.6 / 6.12 + Mosey)
   # ============================================================================
   build-all-versions-mosey:
     name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | ${{ matrix.root_variant }} + Mosey)"
@@ -418,71 +390,26 @@ jobs:
           fi
           git clone --depth=1 https://github.com/thelok1s/mosey-extended.git mosey_extended
 
-      - name: Integrate Root Implementation (${{ matrix.root_variant }})
-        if: ${{ matrix.root_variant != 'NoRoot' }}
+      - name: Integrate FinaSU
         shell: bash
         run: |
           cd kernel_workspace
           DRIVERS_DIR="common/drivers"
           rm -rf "$DRIVERS_DIR/kernelsu"
 
-          case "${{ matrix.root_variant }}" in
-            FinaSU)
-              ROOT_REPO="https://github.com/LyraVoid/FinaSU.git"
-              ROOT_DIR="FinaSU"
-              ROOT_BRANCH=""
-              ;;
-            BakaSU)
-              ROOT_REPO="https://github.com/Baka-SU/BakaSU.git"
-              ROOT_DIR="BakaSU"
-              ROOT_BRANCH=""
-              ;;
-            KernelSU-Next)
-              if [ "${{ inputs.enable_susfs }}" = "true" ]; then
-                ROOT_REPO="https://github.com/pershoot/KernelSU-Next.git"
-                ROOT_DIR="KernelSU-Next"
-                ROOT_BRANCH="dev-susfs"
-              else
-                ROOT_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
-                ROOT_DIR="KernelSU-Next"
-                ROOT_BRANCH="next"
-              fi
-              ;;
-            KernelSU)
-              ROOT_REPO="https://github.com/tiann/KernelSU.git"
-              ROOT_DIR="KernelSU"
-              ROOT_BRANCH="main"
-              ;;
-            ReSukiSU)
-              ROOT_REPO="https://github.com/ReSukiSU/ReSukiSU.git"
-              ROOT_DIR="ReSukiSU"
-              ROOT_BRANCH="main"
-              ;;
-            KowSU)
-              ROOT_REPO="https://github.com/KOWX712/KernelSU.git"
-              ROOT_DIR="KowSU"
-              ROOT_BRANCH="master"
-              ;;
-          esac
+          ROOT_REPO="https://github.com/LyraVoid/FinaSU.git"
+          ROOT_DIR="FinaSU"
 
-          echo "[+] Cloning ${ROOT_DIR} from ${ROOT_REPO}..."
+          echo "[+] Cloning FinaSU from ${ROOT_REPO}..."
           rm -rf "$ROOT_DIR"
-          # FinaSU is cloned from upstream, pinned to the commit that boots. It can't
-          # be a plain vendored folder: kernel/include/uapi is a symlink into the
-          # repo-root uapi/, and Kbuild derives KSU_VERSION from git history - so it
-          # has to be a real, full-depth checkout or the manager sees a bogus version.
+          # FinaSU needs a real full-depth checkout: kernel/include/uapi symlinks
+          # into the repo root and Kbuild derives KSU_VERSION from git history.
           FINASU_PIN="2d5786b9129a254a87ac358c8bec0203ccd53351"
-          if [ "${{ matrix.root_variant }}" = "FinaSU" ]; then
-            git clone "$ROOT_REPO" "$ROOT_DIR"
-            if git -C "$ROOT_DIR" checkout -q "$FINASU_PIN" 2>/dev/null; then
-              echo "[+] FinaSU pinned to ${FINASU_PIN:0:10}"
-            else
-              echo "::warning::could not pin FinaSU to ${FINASU_PIN:0:10}; building default branch tip"
-            fi
-          elif [ -n "$ROOT_BRANCH" ]; then
-            git clone --depth=1 -b "$ROOT_BRANCH" "$ROOT_REPO" "$ROOT_DIR" || git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
+          git clone "$ROOT_REPO" "$ROOT_DIR"
+          if git -C "$ROOT_DIR" checkout -q "$FINASU_PIN" 2>/dev/null; then
+            echo "[+] FinaSU pinned to ${FINASU_PIN:0:10}"
           else
-            git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
+            echo "::warning::could not pin FinaSU to ${FINASU_PIN:0:10}; building branch tip"
           fi
 
           if [ ! -d "$ROOT_DIR/kernel" ]; then
@@ -501,13 +428,10 @@ jobs:
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
           fi
 
-          # FinaSU manager trust: bake the CURRENT FinaSU manager's signing cert
-          # as the auto-trusted slot. Without this, FinaSU's dynamic-manager
-          # default trusts only weishu's KernelSU app and the FinaSU manager
-          # shows "Not installed". We compute the signature from the actual
-          # latest manager APK so it tracks FinaSU updates (v1.4.4+), and fall
-          # back to the known v1.4.x cert if the fetch/compute can't run.
-          if [ "${{ matrix.root_variant }}" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
+          # Bake the current FinaSU manager's signing cert as the auto-trusted
+          # slot (else the manager shows "Not installed"). Computed from the
+          # latest manager APK, with a known v1.4.x fallback.
+          if [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
             FINA_SZ="0x02cc"
             FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
             FMGR="$(ls "$GITHUB_WORKSPACE"/managers/*.apk 2>/dev/null | head -1 || true)"
@@ -541,60 +465,19 @@ jobs:
           KVER_SHORT="${{ matrix.kver }}"
           SUBLEVEL="${{ steps.sync-kernel.outputs.resolved_sublevel }}"
 
-          # 1. SUSFS + Root Compat + Ptrace/Unicode Fixes
-          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
+          # 1. SUSFS (FinaSU carries susfs natively: kernel-side 50_add only)
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
             echo "[+] Copying SUSFS fs/ and include/linux/ sources..."
             cp -rf "$SUSFS_DIR/kernel_patches/fs/"* common/fs/ || true
             cp -rf "$SUSFS_DIR/kernel_patches/include/linux/"* common/include/linux/ || true
-
-            # Root-side susfs. Plain tiann KernelSU is the only one without susfs,
-            # so it's the only one that gets the 10_enable patch. Next (dev-susfs),
-            # BakaSU, ReSukiSU and FinaSU already carry susfs, so handing them
-            # 10_enable or the tiann-shaped drift-fix scripts just breaks them -
-            # that's what blew up FinaSU's core/init.c. They only need the
-            # kernel-side 50_add further down. BakaSU's the odd one: it wants a
-            # tiny file of global symbols the susfs patch expects, which the
-            # bakasu_compat script drops in if it's around.
-            case "${{ matrix.root_variant }}" in
-              KernelSU)
-                if [ -d "$SUSFS_DIR/kernel_patches/KernelSU" ]; then
-                  for kp in "$SUSFS_DIR"/kernel_patches/KernelSU/*.patch; do
-                    [ -f "$kp" ] && (cd KernelSU && patch -p1 --forward --fuzz=3 < "$kp") || true
-                  done
-                fi
-                ;;
-              BakaSU)
-                if [ -f "$GITHUB_WORKSPACE/.github/actions/susfs/bakasu_compat/apply.sh" ]; then
-                  bash "$GITHUB_WORKSPACE/.github/actions/susfs/bakasu_compat/apply.sh" BakaSU "${{ matrix.kernel_version }}" "${SUBLEVEL}" || true
-                fi
-                ;;
-              *)
-                echo "[+] ${{ matrix.root_variant }}: native SUSFS, kernel-side 50_add only (no 10_enable / no compat)"
-                ;;
-            esac
 
             cd common
             for p in "$SUSFS_DIR"/kernel_patches/50_add_susfs_in_gki-*.patch; do
               [ -f "$p" ] && patch -p1 --forward --fuzz=3 < "$p" || true
             done
 
-            # SUSFS core owns the correct fs/notify/fdinfo.c changes for the
-            # current tree now that the perf step no longer double-patches it,
-            # so no fdinfo.c "restore" is needed - restoring stock would only
-            # delete SUSFS's SUS_KSTAT fdinfo spoofing.
-
-            # Ptrace leak fix needs include/linux/tracehook.h, gone after 5.17
-            # (on 6.x it half-applies into signal.c); gate it to 5.x.
-            case "$KVER_SHORT" in
-              5.10|5.15) [ -f "$PATCH_DIR/gki_ptrace.patch" ] && patch -p1 --forward --fuzz=3 < "$PATCH_DIR/gki_ptrace.patch" || true ;;
-            esac
-
-            # utf8-norm bypass fix ships two variants split at 6.1; apply the
-            # matching one instead of letting both fight over the file.
-            case "$KVER_SHORT" in
-              5.10|5.15) U="$PATCH_DIR/common/unicode_bypass_fix_6.1-.patch" ;;
-              *)         U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch" ;;
-            esac
+            # utf8-norm bypass fix (6.1+ variant)
+            U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch"
             [ -f "$U" ] && patch -p1 --forward --fuzz=3 < "$U" || true
           else
             cd common
@@ -602,13 +485,11 @@ jobs:
 
           find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
 
-          # 2. Baseband Guard (BBG)
-          if [ "${{ (inputs.security_guards == 'bbg' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}" = "true" ]; then
+          # 2. Baseband Guard (BBG) - always on
+          if true; then
             echo "[+] Integrating Baseband Guard (BBG)..."
-            # Prefer the vendored Baseband-guard (sources/baseband-guard, pinned).
-            # A throwaway 'git init' (no remote) makes BBG's own setup.sh take its
-            # no-clone / no-fetch path, so it wires the tree from the vendored files
-            # without pulling upstream. Fall back to the upstream setup.sh otherwise.
+            # Vendored Baseband-guard (pinned); a no-remote 'git init' makes its
+            # setup.sh wire the tree from the vendored files without cloning.
             BV="$GITHUB_WORKSPACE/sources/baseband-guard"
             if [ -d "$BV" ]; then
               echo "[+] Using vendored Baseband-guard from repo (pinned)"
@@ -619,11 +500,7 @@ jobs:
               curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
             fi
             find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
-            # BBG's own Makefile bails ("BBG not enable in CONFIG_LSM") unless
-            # 'baseband_guard' is in CONFIG_LSM. setup.sh drops the source in but
-            # never touches the LSM list, so we add it ourselves - into the
-            # default in security/Kconfig (same thing WildKernels' bbg action
-            # does) and into any explicit CONFIG_LSM= in the defconfig.
+            # setup.sh adds the source but not the LSM list entry; add it here.
             if [ -d security/baseband-guard ]; then
               sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
               DEF="arch/arm64/configs/gki_defconfig"
@@ -636,19 +513,12 @@ jobs:
             fi
           fi
 
-          # 2b. NV write guard (opt-in, default OFF). Protects the modem's
-          # irreplaceable nv_protected.bin (RF calibration / IMEI) from a torn
-          # or stray write - the classic way a Shannon efs ends up bricked.
-          # nv_normal.bin is left writable on purpose so the modem can still
-          # heal itself. Ships as a tiny LSM; only bites once it is in CONFIG_LSM.
-          if [ "${{ (inputs.security_guards == 'nv' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}" = "true" ]; then
+          # 2b. NV write guard - always on. Protects the modem's nv_protected.bin
+          # (RF cal / IMEI) from stray writes; nv_normal.bin stays writable.
+          if true; then
             echo "[+] Integrating NV write guard (nv_guard LSM)..."
             NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
-            # Copy the sources in rather than applying a context patch: the
-            # patch was cut against 6.6, and security/Kconfig + security/Makefile
-            # differ across 5.10..6.18, so `patch --fuzz` lands at the wrong
-            # offset on other trees (it corrupted security/Kconfig on 5.10).
-            # The .c/.Kconfig/.Makefile themselves are version-independent.
+            # Copy the sources in (version-independent) rather than a context patch.
             if [ ! -f security/nv_guard/nv_guard.c ] && [ -f "$NVD/nv_guard.c" ]; then
               mkdir -p security/nv_guard
               cp "$NVD/nv_guard.c" "$NVD/Kconfig" "$NVD/Makefile" security/nv_guard/
@@ -744,11 +614,7 @@ jobs:
             if [ "${{ matrix.kernel_version }}" = "android16-6.12" ]; then
               rm -f include/uapi/linux/ntsync.h drivers/misc/ntsync.c
             fi
-            case "${{ matrix.kernel_version }}" in
-              android13-5.10) COMPAT="$NT/ntsync_compat_android12-5.10.patch" ;;
-              android14-5.15) COMPAT="$NT/ntsync_compat_android13-5.15.patch" ;;
-              *)              COMPAT="$NT/ntsync_compat_${{ matrix.kernel_version }}.patch" ;;
-            esac
+            COMPAT="$NT/ntsync_compat_${{ matrix.kernel_version }}.patch"
             if [ -f "$COMPAT" ]; then patch -p1 --forward --fuzz=3 < "$COMPAT" || true; else echo "::warning::NTSync: compat patch not found ($COMPAT)"; fi
             if [ -f "$NT/ntsync_base.patch" ]; then patch -p1 --forward --fuzz=3 < "$NT/ntsync_base.patch" || true; else echo "::warning::NTSync: ntsync_base.patch not found"; fi
           fi
@@ -796,14 +662,10 @@ jobs:
             done
           fi
 
-          # 7. Module Check Bypass (5.10 uses kernel/module.c; 5.15+/6.x uses kernel/module/version.c)
-          if [ "${{ inputs.allow_version_mismatch }}" = "true" ]; then
+          # 7. Module Check Bypass
+          if [ "${{ inputs.allow_version_mismatch }}" = "true" ] && [ -f kernel/module/version.c ]; then
             echo "[+] Applying Module Check Bypass..."
-            if [ -f kernel/module/version.c ]; then
-              sed -i 's/return 0;/return 1;/g' kernel/module/version.c || true
-            elif [ -f kernel/module.c ]; then
-              sed -i '/check_version/,/^}/ s/return 0;/return 1;/g' kernel/module.c || true
-            fi
+            sed -i 's/return 0;/return 1;/g' kernel/module/version.c || true
           fi
 
           find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
@@ -1219,6 +1081,17 @@ jobs:
           MODULE_SOFTDEP("pre: cfg80211");
           WONDER_EOF
 
+      - name: Apply shell->su SELinux hide patch (@Dev_DcS)
+        if: ${{ inputs.hide_shell_su == true }}
+        shell: bash
+        run: |
+          APPLY="$GITHUB_WORKSPACE/Construction_Site/KernelStuff/selinux_hide_shell_su/apply.sh"
+          if [ ! -f "$APPLY" ]; then
+            echo "::error::hide_shell_su is on but $APPLY is missing - commit Construction_Site/KernelStuff/selinux_hide_shell_su/"
+            exit 1
+          fi
+          bash "$APPLY" "$GITHUB_WORKSPACE/kernel_workspace/common"
+
       - name: Configure Kernel (`gki_defconfig` & Kleaf Protected Exports for ${{ matrix.kernel_version }})
         shell: bash
         env:
@@ -1239,14 +1112,18 @@ jobs:
             fi
           }
 
-          # Custom kernel name (replaces the -maybe-dirty scm marker in uname).
-          # Read from an env var so a malicious input can't inject shell.
-          # CONFIG_LOCALVERSION adds the name; AUTO=n drops the git/dirty suffix.
+          # Strip the -dirty / -maybe-dirty scm markers so uname stays clean,
+          # and pin LOCALVERSION_AUTO=n so no git suffix is ever appended.
+          if [ -f scripts/setlocalversion ]; then
+            sed -i 's/-maybe-dirty//g; s/-dirty//g' scripts/setlocalversion
+          fi
+          set_kconfig CONFIG_LOCALVERSION_AUTO n
+
+          # Custom kernel name (env var, sanitized against shell injection)
           if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
             KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
             if [ -n "$KN" ]; then
               set_kconfig CONFIG_LOCALVERSION "\"-$KN\""
-              set_kconfig CONFIG_LOCALVERSION_AUTO n
               echo "[+] Kernel name: -$KN"
             fi
           fi
@@ -1272,12 +1149,10 @@ jobs:
           esac
           echo "KBUILD_CFLAGS += -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-unused-label -Wno-unused-but-set-variable" >> Makefile
 
-          if [ "${{ matrix.root_variant }}" != "NoRoot" ]; then
-            set_kconfig CONFIG_KSU y
-            set_kconfig CONFIG_KALLSYMS_ALL y
-            set_kconfig CONFIG_KPROBES y
-          fi
-          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -f fs/susfs.c ]; then
+          set_kconfig CONFIG_KSU y
+          set_kconfig CONFIG_KALLSYMS_ALL y
+          set_kconfig CONFIG_KPROBES y
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ -f fs/susfs.c ]; then
             set_kconfig CONFIG_KSU_SUSFS y
             set_kconfig CONFIG_KSU_SUSFS_SUS_PATH y
             set_kconfig CONFIG_KSU_SUSFS_SUS_MOUNT y
@@ -1288,22 +1163,16 @@ jobs:
             set_kconfig CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
             set_kconfig CONFIG_KSU_SUSFS_OPEN_REDIRECT y
             set_kconfig CONFIG_KSU_SUSFS_SUS_MAP y
-            # Hook backend (THE boot fix). The SUSFS patch adds inline KSU entry
-            # points (ksu_handle_execveat/stat/faccessat/...) into fs/*. FinaSU
-            # defaults to the Tracepoint backend, so with the patch applied it
-            # gets BOTH tracepoint hooks AND the inline calls on the same
-            # syscalls - double-hook, early-boot panic ("stuck at Google logo").
-            # FinaSU's docs say build Inline when the SUSFS patch is present.
+            # Inline hook backend: FinaSU + the SUSFS patch panics on Tracepoint
+            # (double-hook, stuck at the Google logo), so force Inline.
             set_kconfig CONFIG_KSU_HOOK_SUSFS_INLINE y
             set_kconfig CONFIG_KSU_HOOK_TRACEPOINT n
-            # Integrity (kernel side): the full SUSFS hide set above - path /
-            # mount / kstat hiding, uname + bootconfig/cmdline spoof, open
-            # redirect, map hiding, and symbol hiding - is what lets a rooted
-            # FinaSU kernel avoid trivial detection. FinaSU's dynamic manager
-            # (CONFIG_KSU_DYNAMIC_MANAGER, default y) keeps the manager hidden.
-            # NOTE: this is only the kernel half. Passing Play Integrity
-            # BASIC/DEVICE still needs userspace: a TrickyStore keybox plus a
-            # PlayIntegrityFix/Next module - a kernel build cannot supply those.
+          fi
+
+          # shell->su transition hide (option C). Independent of SUSFS; inert
+          # unless the hide_shell_su.c/.h patch is in the SELinux tree.
+          if [ "${{ inputs.hide_shell_su }}" = "true" ]; then
+            set_kconfig CONFIG_SELINUX_HIDE_SHELL_SU_TRANS y
           fi
 
           if [ "${{ inputs.enable_nomount }}" = "true" ]; then
@@ -1600,7 +1469,7 @@ jobs:
           fi
 
           KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
-          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}-lts-${{ matrix.root_variant }}-Mosey-AnyKernel3.zip"
+          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}-FinaSU-Mosey-AnyKernel3.zip"
           (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .)
 
           cat << EOF > BuildInfo.txt
@@ -1609,9 +1478,9 @@ jobs:
           Page Size: ${{ inputs.page_size }}
           Manifest Branch: ${{ matrix.manifest_branch }}
           SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
-          Root Implementation: ${{ matrix.root_variant }}
+          Root Implementation: FinaSU
           NoMount / TMPFS ACL: ${{ inputs.enable_nomount }}
-          Baseband Guard (BBG): ${{ (inputs.security_guards == 'bbg' || inputs.security_guards == 'bbg+nv') && 'true' || 'false' }}
+          Partition Guards: bbg+nv (always on)
           Networking Suite: ${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}
           Extended BPF/BTF: ${{ inputs.enable_bpf }}
           NTSync (/dev/ntsync): ${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}
@@ -1643,19 +1512,7 @@ jobs:
           mkdir -p managers
           # The in-kernel driver is already baked into the boot image; this
           # just grabs the userspace manager app so it ships in one place.
-          case "${{ matrix.root_variant }}" in
-            FinaSU)        MGR_REPO="LyraVoid/FinaSU" ;;
-            BakaSU)        MGR_REPO="Baka-SU/BakaSU" ;;
-            KernelSU-Next) MGR_REPO="KernelSU-Next/KernelSU-Next" ;;
-            KernelSU)      MGR_REPO="tiann/KernelSU" ;;
-            ReSukiSU)      MGR_REPO="ReSukiSU/ReSukiSU" ;;
-            KowSU)         MGR_REPO="KOWX712/KernelSU" ;;
-            *)             MGR_REPO="" ;;
-          esac
-          if [ -z "$MGR_REPO" ]; then
-            echo "[i] ${{ matrix.root_variant }}: no manager app to fetch"
-            exit 0
-          fi
+          MGR_REPO="LyraVoid/FinaSU"
           echo "[+] Fetching manager APK from $MGR_REPO (latest release)..."
           if gh release download --repo "$MGR_REPO" --pattern '*.apk' --dir managers 2>/dev/null; then
             echo "[+] manager APK(s): $(ls managers 2>/dev/null | tr '\n' ' ')"
