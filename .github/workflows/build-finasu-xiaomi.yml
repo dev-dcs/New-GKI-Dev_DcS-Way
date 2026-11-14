@@ -1223,6 +1223,9 @@ jobs:
           CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
         run: |
           cd kernel_workspace/common
+          # Clean uname insurance: empty .scmversion -> setlocalversion emits
+          # nothing if a build is ever stamped (stamp.bzl strip covers non-stamp).
+          : > .scmversion 2>/dev/null || true
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
           set_kconfig() {
@@ -1236,6 +1239,9 @@ jobs:
               echo "${key}=${val}" >> "$DEFCONFIG"
             fi
           }
+
+          # Strip Kleaf's -maybe-dirty scmversion placeholder (its real source).
+          sed -i 's/-maybe-dirty//g' ../build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
 
           # Custom kernel name (replaces the -maybe-dirty scm marker in uname).
           # Read from an env var so a malicious input can't inject shell.

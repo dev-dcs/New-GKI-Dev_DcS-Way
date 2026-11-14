@@ -1129,6 +1129,9 @@ jobs:
           CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
         run: |
           cd kernel_workspace/common
+          # Clean uname insurance: empty .scmversion -> setlocalversion emits
+          # nothing if a build is ever stamped (stamp.bzl strip covers non-stamp).
+          : > .scmversion 2>/dev/null || true
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
           set_kconfig() {
