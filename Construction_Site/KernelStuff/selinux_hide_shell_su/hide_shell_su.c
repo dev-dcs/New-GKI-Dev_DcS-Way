@@ -57,8 +57,12 @@ static bool hss_do_resolve(gfp_t gfp)
 	u32 s = 0, t = 0;
 	int rc1, rc2;
 
-	rc1 = security_context_str_to_sid(hss_shell_ctx, &s, gfp);
-	rc2 = security_context_str_to_sid(hss_su_ctx, &t, gfp);
+	/* Resolve through the lower, UNHOOKED helper so our own lookup of
+	 * u:r:su:s0 is never swallowed by ksu_hide_sepol_context() below, which
+	 * now forces EINVAL on :r:su: for app callers. The lazy path runs in app
+	 * context, so without this bypass the mask would fail to prime itself. */
+	rc1 = security_context_to_sid(hss_shell_ctx, strlen(hss_shell_ctx), &s, gfp);
+	rc2 = security_context_to_sid(hss_su_ctx, strlen(hss_su_ctx), &t, gfp);
 	if (rc1 || rc2) {
 		WRITE_ONCE(hss_ready, false);
 		pr_warn_ratelimited("hideshellsu: resolve failed (shell rc=%d, su rc=%d)\n",
@@ -124,14 +128,25 @@ void ksu_mask_shell_su(u32 ssid, u32 tsid, u16 tclass,
 /*
  * TYPE fields of the contexts Duck's materialization oracles look for. The
  * match is on the ":<role>:<type>:" slice, so MLS/category suffixes don't
- * matter. ksu / ksu_file are safe to hide: nothing in an app process
- * legitimately string-resolves them (KSU talks to its driver, not selinuxfs).
+ * matter.
+ *
+ *   :r:su:     The one still leaking as "shell -> su transition: Allowed".
+ *              A stock USER build has no su type, so u:r:su:s0 is an invalid
+ *              context there; forcing EINVAL for app callers makes the
+ *              DirtySepolicy edge query abort with INVALID_CONTEXT instead of
+ *              returning Allowed - i.e. it looks exactly like stock. Real su
+ *              callers (shell/root, uid < 10000) are never touched, and our
+ *              own primer resolves su through the unhooked helper above.
+ *   :r:ksu: / :object_r:ksu_file:
+ *              Safe to hide: nothing in an app process legitimately
+ *              string-resolves these (KSU talks to its driver, not selinuxfs).
  *
  * The Xposed types are left commented because LSPosed/Zygisk living *inside*
  * an app process may resolve them for real file labeling - enabling them also
  * clears the LSPosed "dirty policy" warning but TEST that LSPosed still works.
  */
 static const char * const hss_hidden_types[] = {
+	":r:su:",
 	":r:ksu:",
 	":object_r:ksu_file:",
 	/* ":object_r:xposed_data:",   enable to also hide LSPosed (see note) */

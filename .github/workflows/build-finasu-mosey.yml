@@ -66,9 +66,9 @@ on:
         type: boolean
         default: true
       hide_root_contexts:
-        description: "Also hide the KSU/root SELinux contexts from app probes (CONFIG_SELINUX_HIDE_ROOT_CONTEXTS). EINVALs ksu/ksu_file (edit the list for Xposed). Clears the 'KSU context materialized' danger but is riskier - test KSU/LSPosed. Requires hide_shell_su ON."
+        description: "Hide the KSU/root SELinux contexts from app probes (CONFIG_SELINUX_HIDE_ROOT_CONTEXTS). EINVALs su/ksu/ksu_file (edit the list for Xposed). This is what now neutralizes the DirtySepolicy 'shell->su transition Allowed' edge (su looks invalid = stock), plus the 'context materialized' oracle. Riskier - test KSU/LSPosed. Requires hide_shell_su ON."
         type: boolean
-        default: false
+        default: true
       enable_nomount:
         description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
         type: boolean
