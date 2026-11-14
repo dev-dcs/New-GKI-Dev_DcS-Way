@@ -18,13 +18,13 @@ on:
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "Specific LTS Subversion (e.g. 6.6.144, 6.1.145, 6.12.92) or leave blank for latest LTS"
-        type: string
-        default: "6.6.144"
-      kernel_name:
-        description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
+        description: "Specific LTS Subversion (e.g. 6.6.144) - or leave blank / 'LTS' for the latest LTS of the selected family"
         type: string
         default: ""
+      kernel_name:
+        description: "Custom kernel name appended to uname. Letters/digits/._- only. Blank = stock."
+        type: string
+        default: "Dev_DcS"
       page_size:
         description: "ARM64 Memory Page Size (4k standard, 16k for supported 6.6/6.12 targets)"
         type: choice
@@ -84,18 +84,6 @@ on:
           - Magic-Mount-rs
           - none
         default: NoMount
-      ship_metamodule:
-        description: "Also fetch + attach the selected metamodule's release zip so its version matches the kernel (avoids a driver/module mismatch)"
-        type: boolean
-        default: false
-      enable_bbg:
-        description: "Enable Baseband Guard (BBG) LSM Partition Protection"
-        type: boolean
-        default: true
-      nv_write_guard:
-        description: "NV write guard: block writes to the modem's irreplaceable nv_protected.bin (RF-cal/IMEI). OFF by default - see README before enabling."
-        type: boolean
-        default: false
       security_patches:
         description: "Security patch level: monthly = latest tagged GKI/LTS (Google monthly, tested); latest-cve = also apply post-release stable CVE fixes on top (bleeding edge, may skip on conflict - READ THE README WARNING); none = base as pinned"
         type: choice
@@ -210,7 +198,7 @@ jobs:
           include = []
           for fam in selected_families:
               lts_val = "lts"
-              if req_lts:
+              if req_lts and req_lts[0].isdigit():
                   if req_lts.startswith(fam["kver"] + "."):
                       lts_val = req_lts
                   elif req_family != "all":
@@ -531,7 +519,7 @@ jobs:
           find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
 
           # 2. Baseband Guard (BBG)
-          if [ "${{ inputs.enable_bbg }}" = "true" ]; then
+          if [ "${{ 'true' }}" = "true" ]; then
             echo "[+] Integrating Baseband Guard (BBG)..."
             curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
             find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
@@ -557,7 +545,7 @@ jobs:
           # or stray write - the classic way a Shannon efs ends up bricked.
           # nv_normal.bin is left writable on purpose so the modem can still
           # heal itself. Ships as a tiny LSM; only bites once it is in CONFIG_LSM.
-          if [ "${{ inputs.nv_write_guard }}" = "true" ]; then
+          if [ "${{ 'true' }}" = "true" ]; then
             echo "[+] Integrating NV write guard (nv_guard LSM)..."
             NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
             # Copy the sources in rather than applying a context patch: the
@@ -1159,6 +1147,8 @@ jobs:
           # -dirty) so no release ever ships a "dirty" build name, with or
           # without a custom name - strip it at the source too, belt and braces.
           sed -i 's/-maybe-dirty//g; s/-dirty//g' scripts/setlocalversion 2>/dev/null || true
+          # the real -maybe-dirty is Kleaf's non-stamp placeholder in stamp.bzl
+          sed -i 's/-maybe-dirty//g' ../build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           set_kconfig CONFIG_LOCALVERSION_AUTO n
           # Custom kernel name (env var so a malicious input can't inject shell).
           if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
@@ -1504,7 +1494,7 @@ jobs:
           SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
           Root Implementation: ${{ matrix.root_variant }}
           Metamodule: ${{ inputs.metamodule }}
-          Baseband Guard (BBG): ${{ inputs.enable_bbg }}
+          Baseband Guard (BBG): ${{ 'true' }}
           Networking Suite: ${{ inputs.enable_networking }}
           Extended BPF/BTF: ${{ inputs.enable_bpf }}
           NTSync (/dev/ntsync): ${{ inputs.enable_ntsync }}
@@ -1563,7 +1553,7 @@ jobs:
           path: managers/*.apk
 
       - name: Fetch metamodule
-        if: ${{ inputs.ship_metamodule == true && inputs.metamodule != 'none' }}
+        if: ${{ inputs.metamodule != 'none' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1586,7 +1576,7 @@ jobs:
           fi
 
       - name: Upload metamodule
-        if: ${{ inputs.ship_metamodule == true && hashFiles('metamodule_out/*') != '' }}
+        if: ${{ hashFiles('metamodule_out/*') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-${{ inputs.metamodule }}"

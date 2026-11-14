@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 #
-# apply.sh - drop the shell->su SELinux hide into a GKI SELinux tree and wire
-# the touch points, idempotently. Fail-closed: if a required anchor isn't found,
-# exit non-zero so the build STOPS instead of shipping a kernel that claims the
-# hide but doesn't carry it. Re-running is a no-op.
+# apply.sh - wire the SELinux hide hooks into a GKI SELinux tree, idempotently.
+# Fail-closed: a missing anchor stops the build instead of shipping a kernel
+# that claims the hide but doesn't carry it. Re-running is a no-op.
+#
+# Supports two app-scoped features, both gated by their own Kconfig:
+#   CONFIG_SELINUX_HIDE_SHELL_SU_TRANS  - shell->su transition mask (v2)
+#   CONFIG_SELINUX_HIDE_ROOT_CONTEXTS   - ksu/root context EINVAL hide (v3)
 #
 # Anchors verified against android.googlesource.com kernel/common android15-6.6
-# (security_compute_av_user is void + multi-line; avc_has_perm_noaudit's cache
-# miss lives in avc_perm_nonode and the fast path computes denied from the node
-# before memcpy - so both avc.c paths are masked). @Dev_DcS
+# and android16-6.12. 6.1 (per-state SELinux) is skipped with a warning.
+# @Dev_DcS
 #
-# usage: apply.sh <kernel common/ dir>   (the dir that holds security/selinux)
+# usage: apply.sh <kernel common/ dir>
 #
 set -euo pipefail
 
@@ -20,12 +22,8 @@ SEL="$K/security/selinux"
 
 [ -d "$SEL" ] || { echo "::error::no $SEL - is '$K' the GKI common/ tree?"; exit 1; }
 
-# Supported: 6.6 / 6.12 (global-state SELinux, avc_has_perm_noaudit split into
-# avc_perm_nonode). 6.1 and older use the per-state API (security_*(state, ...))
-# and a different avc layout, so hide_shell_su.c won't compile there - skip with
-# a loud warning rather than fail the build or silently ship nothing.
 if ! grep -q 'avc_perm_nonode' "$SEL/avc.c" 2>/dev/null; then
-  echo "::warning::shell->su hide targets 6.6/6.12; this tree looks like 6.1/older (per-state SELinux) - SKIPPING the hide for this build. Turn hide_shell_su off for 6.1, or hand-port a per-state variant."
+  echo "::warning::shell->su hide targets 6.6/6.12; this tree looks like 6.1/older (per-state SELinux) - SKIPPING the hide for this build."
   exit 0
 fi
 
@@ -42,11 +40,22 @@ config SELINUX_HIDE_SHELL_SU_TRANS
 	default n
 	help
 	  Masks PROCESS__TRANSITION in the shell->su access decision for app
-	  callers (uid >= 10000). Defeats checkSELinuxAccess-style probes without
-	  removing the rule from the policy image. See
+	  callers (uid >= 10000). See
 	  Construction_Site/KernelStuff/selinux_hide_shell_su (@Dev_DcS).
+
+config SELINUX_HIDE_ROOT_CONTEXTS
+	bool "Hide KSU/root SELinux contexts from app probes"
+	depends on SELINUX_HIDE_SHELL_SU_TRANS
+	default n
+	help
+	  Returns -EINVAL from security_context_str_to_sid() for the KSU/root
+	  context strings when an app (uid >= 10000) resolves them, so the
+	  /context validity oracle, /proc/self/attr/current writes, and /access
+	  edge queries all see those contexts as invalid. Edit hss_hidden_types[]
+	  in hide_shell_su.c to change the list. Riskier than the transition mask
+	  - test that KSU and (if you enable the Xposed types) LSPosed still work.
 KEOF
-echo "[+] Kconfig entry added"
+echo "[+] Kconfig entries added"
 fi
 
 if ! grep -q 'hide_shell_su.o' "$SEL/Makefile"; then
@@ -60,69 +69,83 @@ sel = sys.argv[1]
 
 def patch(path, fn):
     s = open(path, encoding="utf-8").read()
-    if "ksu_mask_shell_su" in s:
-        print("[=] %s already patched" % path); return
     out = fn(s)
     if out is None:
         print("::error::anchor missing in %s - apply by hand per INTEGRATION.md" % path)
         sys.exit(1)
-    open(path, "w", encoding="utf-8").write(out)
-    print("[+] patched %s" % path)
+    if out != s:
+        open(path, "w", encoding="utf-8").write(out)
+        print("[+] patched %s" % path)
+    else:
+        print("[=] %s already patched" % path)
+
+def ensure_include(s, after):
+    if '#include "hide_shell_su.h"' in s:
+        return s
+    if after not in s:
+        return None
+    return s.replace(after, after + '#include "hide_shell_su.h"\n', 1)
 
 def avc(s):
-    inc = '#include "avc.h"\n'
-    if inc not in s:
+    s = ensure_include(s, '#include "avc.h"\n')
+    if s is None:
         return None
-    if '#include "hide_shell_su.h"' not in s:
-        s = s.replace(inc, inc + '#include "hide_shell_su.h"\n', 1)
-    # slow path (avc_perm_nonode): mask the freshly computed avd
-    a1 = ('\tavc_compute_av(ssid, tsid, tclass, avd, &xp_node);\n'
-          '\tdenied = requested & ~(avd->allowed);')
-    if s.count(a1) != 1:
-        return None
-    s = s.replace(a1,
-        '\tavc_compute_av(ssid, tsid, tclass, avd, &xp_node);\n'
-        '\tksu_mask_shell_su(ssid, tsid, tclass, avd, true);\n'
-        '\tdenied = requested & ~(avd->allowed);', 1)
-    # fast path: denied was taken from the cached node before memcpy, so after
-    # copying into the local avd we mask it and recompute denied from the copy.
-    a2 = ('\tdenied = requested & ~node->ae.avd.allowed;\n'
-          '\tmemcpy(avd, &node->ae.avd, sizeof(*avd));')
-    if s.count(a2) != 1:
-        return None
-    s = s.replace(a2,
-        a2 + '\n'
-        '\tksu_mask_shell_su(ssid, tsid, tclass, avd, true);\n'
-        '\tdenied = requested & ~(avd->allowed);', 1)
+    if 'ksu_mask_shell_su' not in s:
+        a1 = ('\tavc_compute_av(ssid, tsid, tclass, avd, &xp_node);\n'
+              '\tdenied = requested & ~(avd->allowed);')
+        if s.count(a1) != 1:
+            return None
+        s = s.replace(a1,
+            '\tavc_compute_av(ssid, tsid, tclass, avd, &xp_node);\n'
+            '\tksu_mask_shell_su(ssid, tsid, tclass, avd, true);\n'
+            '\tdenied = requested & ~(avd->allowed);', 1)
+        a2 = ('\tdenied = requested & ~node->ae.avd.allowed;\n'
+              '\tmemcpy(avd, &node->ae.avd, sizeof(*avd));')
+        if s.count(a2) != 1:
+            return None
+        s = s.replace(a2,
+            a2 + '\n\tksu_mask_shell_su(ssid, tsid, tclass, avd, true);\n'
+                 '\tdenied = requested & ~(avd->allowed);', 1)
     return s
 
 def services(s):
-    inc = '#include "security.h"\n'
-    if inc not in s:
+    s = ensure_include(s, '#include "security.h"\n')
+    if s is None:
         return None
-    if '#include "hide_shell_su.h"' not in s:
-        s = s.replace(inc, inc + '#include "hide_shell_su.h"\n', 1)
-    # probe path: mask after the compute inside security_compute_av_user only
-    i = s.find('void security_compute_av_user(u32 ssid,')
-    if i < 0:
-        return None
-    cc = s.find('context_struct_compute_av(', i)
-    if cc < 0:
-        return None
-    end = s.find(';', cc)
-    if end < 0:
-        return None
-    end += 1
-    s = s[:end] + '\n\tksu_mask_shell_su(ssid, tsid, tclass, avd, false);' + s[end:]
-    # resolve shell/su SIDs on every policy (re)load
-    pl = '\tselinux_status_update_policyload(seqno);'
-    if s.count(pl) != 1:
-        return None
-    s = s.replace(pl, pl + '\n\tksu_hide_su_resolve_sids();', 1)
+    # shell->su: mask the /access compute + resolve SIDs on policy load
+    if 'ksu_mask_shell_su' not in s:
+        i = s.find('void security_compute_av_user(u32 ssid,')
+        if i < 0:
+            return None
+        cc = s.find('context_struct_compute_av(', i)
+        if cc < 0:
+            return None
+        end = s.find(';', cc)
+        if end < 0:
+            return None
+        end += 1
+        s = s[:end] + '\n\tksu_mask_shell_su(ssid, tsid, tclass, avd, false);' + s[end:]
+        pl = '\tselinux_status_update_policyload(seqno);'
+        if s.count(pl) != 1:
+            return None
+        s = s.replace(pl, pl + '\n\tksu_hide_su_resolve_sids();', 1)
+    # context-materialization hide: EINVAL root contexts at the str->sid chokepoint
+    if 'ksu_hide_sepol_context' not in s:
+        a = ('int security_context_str_to_sid(const char *scontext, u32 *sid, gfp_t gfp)\n'
+             '{\n'
+             '\treturn security_context_to_sid(scontext, strlen(scontext),')
+        if s.count(a) != 1:
+            return None
+        s = s.replace(a,
+             'int security_context_str_to_sid(const char *scontext, u32 *sid, gfp_t gfp)\n'
+             '{\n'
+             '\tif (ksu_hide_sepol_context(scontext))\n'
+             '\t\treturn -EINVAL;\n'
+             '\treturn security_context_to_sid(scontext, strlen(scontext),', 1)
     return s
 
 patch(sel + "/avc.c", avc)
 patch(sel + "/ss/services.c", services)
 PYEOF
 
-echo "[+] shell->su hide applied to $SEL"
+echo "[+] SELinux hide applied to $SEL"

@@ -65,6 +65,10 @@ on:
         description: "Mask the shell->su SELinux transition from app probes (CONFIG_SELINUX_HIDE_SHELL_SU_TRANS). Needs the hide_shell_su.c/.h patch in-tree - inert without it. Defeats checkSELinuxAccess-style root detectors; leave ON for a hardened daily driver."
         type: boolean
         default: true
+      hide_root_contexts:
+        description: "Also hide the KSU/root SELinux contexts from app probes (CONFIG_SELINUX_HIDE_ROOT_CONTEXTS). EINVALs ksu/ksu_file (edit the list for Xposed). Clears the 'KSU context materialized' danger but is riskier - test KSU/LSPosed. Requires hide_shell_su ON."
+        type: boolean
+        default: false
       enable_nomount:
         description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
         type: boolean
@@ -1173,6 +1177,9 @@ jobs:
           # unless the hide_shell_su.c/.h patch is in the SELinux tree.
           if [ "${{ inputs.hide_shell_su }}" = "true" ]; then
             set_kconfig CONFIG_SELINUX_HIDE_SHELL_SU_TRANS y
+          fi
+          if [ "${{ inputs.hide_root_contexts }}" = "true" ]; then
+            set_kconfig CONFIG_SELINUX_HIDE_ROOT_CONTEXTS y
           fi
 
           if [ "${{ inputs.enable_nomount }}" = "true" ]; then

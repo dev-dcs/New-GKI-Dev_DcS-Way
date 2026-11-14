@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * hide_shell_su.c - mask the shell -> su : process transition decision for app
- * callers, so a userspace probe (checkSELinuxAccess / reads of
- * /sys/fs/selinux/access) sees "denied" while the loaded policy keeps the rule.
+ * hide_shell_su.c - hide KernelSU's SELinux footprint from app probes.
  *
- * v2 - self-healing + instrumented. The SIDs for shell/su are re-resolved
- * lazily and re-cached whenever the policy generation (avd->seqno) changes, so
- * the mask no longer depends on a single resolve at policy-commit succeeding.
- * dmesg lines are tagged "hideshellsu:" so one `dmesg | grep hideshellsu`
- * (or logcat -b kernel) after a scan shows exactly what the hook saw. Once it's
- * confirmed working, drop the pr_* lines for a quiet build.
+ * Two independently-toggled features, both app-scoped (uid >= 10000) so the
+ * system, adb shell and root are never affected:
  *
- * Opt-in via CONFIG_SELINUX_HIDE_SHELL_SU_TRANS. @Dev_DcS
+ *   CONFIG_SELINUX_HIDE_SHELL_SU_TRANS  (v2, proven)
+ *     Masks the shell -> su : process transition decision, so
+ *     checkSELinuxAccess / reads of /sys/fs/selinux/access see "denied".
+ *
+ *   CONFIG_SELINUX_HIDE_ROOT_CONTEXTS   (v3, new - riskier, test it)
+ *     Makes the KSU/root context strings look INVALID to app probes by
+ *     returning -EINVAL from security_context_str_to_sid(). That single
+ *     chokepoint feeds the /context validity oracle, /proc/self/attr/current
+ *     writes, and the /access edge queries, so it hides all three
+ *     "materialized context" surfaces at once.
+ *
+ * dmesg is tagged "hideshellsu:". Drop the pr_* lines for a quiet build once
+ * you've confirmed it. @Dev_DcS
  */
 #include <linux/kernel.h>
 #include <linux/printk.h>
+#include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/uidgid.h>
@@ -26,6 +33,15 @@
 
 /* Android app uid floor (AID_APP_START); isolated + app_zygote sit above it. */
 #define HSS_AID_APP_START 10000
+
+static __always_inline bool hss_caller_is_app(void)
+{
+	return from_kuid(&init_user_ns, current_uid()) >= HSS_AID_APP_START;
+}
+
+/* ------------------------------------------------------------------ */
+/*  shell -> su : process transition mask                             */
+/* ------------------------------------------------------------------ */
 
 /* Confirm against your policy: sesearch -A -s shell -t su -c process -p transition */
 static const char hss_shell_ctx[] = "u:r:shell:s0";
@@ -65,11 +81,6 @@ void ksu_hide_su_resolve_sids(void)
 	hss_do_resolve(GFP_KERNEL);
 }
 
-static __always_inline bool hss_caller_is_app(void)
-{
-	return from_kuid(&init_user_ns, current_uid()) >= HSS_AID_APP_START;
-}
-
 void ksu_mask_shell_su(u32 ssid, u32 tsid, u16 tclass,
 		       struct av_decision *avd, bool audit_too)
 {
@@ -89,13 +100,10 @@ void ksu_mask_shell_su(u32 ssid, u32 tsid, u16 tclass,
 
 	app = hss_caller_is_app();
 
-	/* Diagnostic: every app-initiated process-transition decision, so a
-	 * Duck shell->su probe shows its ssid/tsid next to what we resolved. */
 	if (app && (avd->allowed & PROCESS__TRANSITION))
-		pr_info_ratelimited("hideshellsu: xq ssid=%u tsid=%u want(shell=%u su=%u) uid=%u seqno=%u/%u\n",
+		pr_info_ratelimited("hideshellsu: xq ssid=%u tsid=%u want(shell=%u su=%u) uid=%u\n",
 				    ssid, tsid, hss_shell_sid, hss_su_sid,
-				    from_kuid(&init_user_ns, current_uid()),
-				    avd->seqno, hss_seqno);
+				    from_kuid(&init_user_ns, current_uid()));
 
 	if (ssid != hss_shell_sid || tsid != hss_su_sid)
 		return;
@@ -108,3 +116,46 @@ void ksu_mask_shell_su(u32 ssid, u32 tsid, u16 tclass,
 	pr_info_ratelimited("hideshellsu: MASKED shell->su transition for uid=%u\n",
 			    from_kuid(&init_user_ns, current_uid()));
 }
+
+/* ------------------------------------------------------------------ */
+/*  root-context materialization hide (v3)                            */
+/* ------------------------------------------------------------------ */
+#ifdef CONFIG_SELINUX_HIDE_ROOT_CONTEXTS
+/*
+ * TYPE fields of the contexts Duck's materialization oracles look for. The
+ * match is on the ":<role>:<type>:" slice, so MLS/category suffixes don't
+ * matter. ksu / ksu_file are safe to hide: nothing in an app process
+ * legitimately string-resolves them (KSU talks to its driver, not selinuxfs).
+ *
+ * The Xposed types are left commented because LSPosed/Zygisk living *inside*
+ * an app process may resolve them for real file labeling - enabling them also
+ * clears the LSPosed "dirty policy" warning but TEST that LSPosed still works.
+ */
+static const char * const hss_hidden_types[] = {
+	":r:ksu:",
+	":object_r:ksu_file:",
+	/* ":object_r:xposed_data:",   enable to also hide LSPosed (see note) */
+	/* ":object_r:xposed_file:", */
+	NULL,
+};
+
+bool ksu_hide_sepol_context(const char *scontext)
+{
+	const char * const *p;
+
+	if (!scontext)
+		return false;
+	if (!hss_caller_is_app())		/* spare system / root / adb */
+		return false;
+
+	for (p = hss_hidden_types; *p; p++) {
+		if (strstr(scontext, *p)) {
+			pr_info_ratelimited("hideshellsu: hid context '%s' from uid=%u\n",
+				scontext,
+				from_kuid(&init_user_ns, current_uid()));
+			return true;
+		}
+	}
+	return false;
+}
+#endif /* CONFIG_SELINUX_HIDE_ROOT_CONTEXTS */
