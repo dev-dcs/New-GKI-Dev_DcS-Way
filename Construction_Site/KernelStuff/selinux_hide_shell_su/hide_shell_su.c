@@ -27,6 +27,7 @@
 #include <linux/uidgid.h>
 #include <linux/user_namespace.h>
 #include <linux/compiler.h>
+#include <linux/slab.h>
 #include "security.h"
 #include "avc.h"
 #include "hide_shell_su.h"
@@ -43,82 +44,57 @@ static __always_inline bool hss_caller_is_app(void)
 /*  shell -> su : process transition mask                             */
 /* ------------------------------------------------------------------ */
 
-/* Confirm against your policy: sesearch -A -s shell -t su -c process -p transition */
-static const char hss_shell_ctx[] = "u:r:shell:s0";
-static const char hss_su_ctx[]    = "u:r:su:s0";
-
-static u32  hss_shell_sid;
-static u32  hss_su_sid;
-static u32  hss_seqno = (u32)-1;	/* policy generation the SIDs were cached at */
-static bool hss_ready;
-
-static bool hss_do_resolve(gfp_t gfp)
-{
-	u32 s = 0, t = 0;
-	int rc1, rc2;
-
-	/* Resolve through the lower, UNHOOKED helper so our own lookup of
-	 * u:r:su:s0 is never swallowed by ksu_hide_sepol_context() below, which
-	 * now forces EINVAL on :r:su: for app callers. The lazy path runs in app
-	 * context, so without this bypass the mask would fail to prime itself. */
-	rc1 = security_context_to_sid(hss_shell_ctx, strlen(hss_shell_ctx), &s, gfp);
-	rc2 = security_context_to_sid(hss_su_ctx, strlen(hss_su_ctx), &t, gfp);
-	if (rc1 || rc2) {
-		WRITE_ONCE(hss_ready, false);
-		pr_warn_ratelimited("hideshellsu: resolve failed (shell rc=%d, su rc=%d)\n",
-				    rc1, rc2);
-		return false;
-	}
-	hss_shell_sid = s;
-	hss_su_sid = t;
-	smp_wmb();
-	WRITE_ONCE(hss_ready, true);
-	pr_info("hideshellsu: resolved shell_sid=%u su_sid=%u\n", s, t);
-	return true;
-}
-
-/* Primer from selinux_policy_commit (sleepable); the lazy path below covers it
- * if this ever runs too early or fails. */
+/* Primer kept as a no-op: the string-match mask needs no cached SIDs. apply.sh
+ * still injects a call to this after policy load, so keep the symbol defined. */
 void ksu_hide_su_resolve_sids(void)
 {
-	hss_seqno = (u32)-1;
-	hss_do_resolve(GFP_KERNEL);
 }
 
 void ksu_mask_shell_su(u32 ssid, u32 tsid, u16 tclass,
 		       struct av_decision *avd, bool audit_too)
 {
-	bool app;
+	char *sctx = NULL, *tctx = NULL;
+	u32 slen, tlen;
 
 	if (tclass != SECCLASS_PROCESS)
 		return;
+	/* Only act when the transition is currently allowed - nothing to strip
+	 * otherwise, and this gates the string lookups to the rare case. */
+	if (!(avd->allowed & PROCESS__TRANSITION))
+		return;
+	if (!hss_caller_is_app())		/* spare system / root / adb shell */
+		return;
 
-	/* Self-healing: resolve on first use and whenever the policy changed.
-	 * GFP_ATOMIC because the fast AVC path calls us under rcu_read_lock;
-	 * shell/su already live in the sidtab, so this is a lookup, not an add. */
-	if (!READ_ONCE(hss_ready) || avd->seqno != hss_seqno) {
-		if (!hss_do_resolve(GFP_ATOMIC))
-			return;
-		hss_seqno = avd->seqno;
+	/*
+	 * Match by CONTEXT STRING, not SID. KSU's post-boot sepolicy injection
+	 * renumbers shell/su to unpredictable SIDs (93/94 at policy commit, but
+	 * 3840+/4016+/4393+ at query time), so a cached ssid==shell_sid test never
+	 * fired - see the "xq ... want(shell=93 su=94)" dmesg. We only reach here
+	 * for an app-initiated, transition-allowing process check (rare), and
+	 * security_sid_to_context() stringifies with GFP_ATOMIC internally, so it
+	 * is safe on the rcu/avc fast path - the AVC audit path stringifies SIDs
+	 * the same way under the same lock.
+	 */
+	if (security_sid_to_context(ssid, &sctx, &slen))
+		return;
+	if (security_sid_to_context(tsid, &tctx, &tlen))
+		goto out;
+
+	/* ":r:shell:" / ":r:su:" match the role:type slice; the user field, MLS
+	 * and categories are ignored, and neither substring hits another domain
+	 * (shell_data_file is :object_r:, surfaceflinger is :r:surfaceflinger:). */
+	if (strstr(sctx, ":r:shell:") && strstr(tctx, ":r:su:")) {
+		avd->allowed &= ~PROCESS__TRANSITION;
+		if (audit_too)
+			avd->auditdeny &= ~PROCESS__TRANSITION;
+		pr_info_ratelimited("hideshellsu: MASKED %s -> %s for uid=%u (ssid=%u tsid=%u)\n",
+				    sctx, tctx,
+				    from_kuid(&init_user_ns, current_uid()),
+				    ssid, tsid);
 	}
-
-	app = hss_caller_is_app();
-
-	if (app && (avd->allowed & PROCESS__TRANSITION))
-		pr_info_ratelimited("hideshellsu: xq ssid=%u tsid=%u want(shell=%u su=%u) uid=%u\n",
-				    ssid, tsid, hss_shell_sid, hss_su_sid,
-				    from_kuid(&init_user_ns, current_uid()));
-
-	if (ssid != hss_shell_sid || tsid != hss_su_sid)
-		return;
-	if (!app)
-		return;
-
-	avd->allowed &= ~PROCESS__TRANSITION;
-	if (audit_too)
-		avd->auditdeny &= ~PROCESS__TRANSITION;
-	pr_info_ratelimited("hideshellsu: MASKED shell->su transition for uid=%u\n",
-			    from_kuid(&init_user_ns, current_uid()));
+out:
+	kfree(sctx);
+	kfree(tctx);
 }
 
 /* ------------------------------------------------------------------ */
