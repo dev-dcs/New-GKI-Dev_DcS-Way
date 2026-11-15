@@ -1,0 +1,150 @@
+usb: gadget: add kernel.deny_usb_gadget peripheral kill switch
+
+Adds a runtime switch at /proc/sys/kernel/deny_usb_gadget. While set to 1
+the UDC core refuses to pull up the data lines, so the device cannot
+present any gadget function to a host; VBUS (charging) is left alone.
+Writing 1 bounces every registered UDC through its existing vbus work so
+they disconnect immediately; writing 0 lets VBUS drive them back up via
+the core's own connect-control path. soft_connect, UDC bind and function
+activation cannot reconnect while the switch is set. Flipping it needs
+CAP_SYS_ADMIN; it defaults to 0.
+
+The write handler deliberately does NOT call the connect/disconnect helpers
+directly: those take connect_lock and (on disconnect) udc_lock, so invoking
+them while walking udc_list under udc_lock would invert the
+connect_lock -> udc_lock order and recurse on udc_lock. Scheduling each
+UDC's vbus work keeps the locking order intact.
+
+Only file-scope statics and a register_sysctl() call are added; the two
+touched helpers are static. No exported symbol, signature or
+module-visible struct changes - the GKI KMI is untouched.
+
+Signed-off-by: @Dev_DcS
+---
+diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
+index bac6dd8..0a8f933 100644
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -17,6 +17,8 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/workqueue.h>
++#include <linux/capability.h>
++#include <linux/sysctl.h>
+ 
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/gadget.h>
+@@ -68,6 +70,15 @@ static LIST_HEAD(udc_list);
+ /* Protects udc_list, udc->driver, driver->is_bound, and related calls */
+ static DEFINE_MUTEX(udc_lock);
+ 
++/*
++ * USB gadget/peripheral kill switch. When deny_usb_gadget is set to 1 the
++ * UDC core refuses to pull up the data lines, so the device cannot present
++ * itself to a host; VBUS (charging) is left untouched. The knob lives at
++ * /proc/sys/kernel/deny_usb_gadget and only CAP_SYS_ADMIN may flip it. It
++ * defaults to 0, so stock behaviour is unchanged.  -- @Dev_DcS
++ */
++static int deny_usb_gadget __read_mostly;
++
+ /* ------------------------------------------------------------------------- */
+ 
+ /**
+@@ -704,6 +715,11 @@ static int usb_gadget_connect_locked(struct usb_gadget *gadget)
+ {
+ 	int ret = 0;
+ 
++	if (deny_usb_gadget) {
++		ret = -EACCES;
++		goto out;
++	}
++
+ 	if (!gadget->ops->pullup) {
+ 		ret = -EOPNOTSUPP;
+ 		goto out;
+@@ -1129,7 +1145,7 @@ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
+ /* Acquire connect_lock before calling this function. */
+ static void usb_udc_connect_control_locked(struct usb_udc *udc) __must_hold(&udc->connect_lock)
+ {
+-	if (udc->vbus)
++	if (udc->vbus && !deny_usb_gadget)
+ 		usb_gadget_connect_locked(udc->gadget);
+ 	else
+ 		usb_gadget_disconnect_locked(udc->gadget);
+@@ -1888,6 +1904,52 @@ static const struct bus_type gadget_bus_type = {
+ 	.match = gadget_match_driver,
+ };
+ 
++static int proc_deny_usb_gadget(struct ctl_table *table, int write,
++		void *buffer, size_t *lenp, loff_t *ppos)
++{
++	struct usb_udc *udc;
++	int ret;
++
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++	if (ret || !write)
++		return ret;
++
++	/*
++	 * Re-run the connect decision for every registered UDC. Setting the
++	 * flag forces usb_udc_connect_control_locked() down the disconnect
++	 * path; clearing it lets VBUS drive the gadget back up. We can't poke
++	 * the connect/disconnect helpers directly from here: they take
++	 * connect_lock and (on disconnect) udc_lock, so calling them while
++	 * holding udc_lock would invert the connect_lock -> udc_lock order and
++	 * recurse on udc_lock. Bouncing through each UDC's existing vbus work
++	 * keeps the locking honest and reuses the core's own connect logic.
++	 */
++	mutex_lock(&udc_lock);
++	list_for_each_entry(udc, &udc_list, list)
++		schedule_work(&udc->vbus_work);
++	mutex_unlock(&udc_lock);
++
++	return 0;
++}
++
++static struct ctl_table usb_gadget_sysctls[] = {
++	{
++		.procname	= "deny_usb_gadget",
++		.data		= &deny_usb_gadget,
++		.maxlen		= sizeof(deny_usb_gadget),
++		.mode		= 0644,
++		.proc_handler	= proc_deny_usb_gadget,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{ }
++};
++
++static struct ctl_table_header *usb_gadget_sysctl_hdr;
++
+ static int __init usb_udc_init(void)
+ {
+ 	int rc;
+@@ -1897,14 +1959,21 @@ static int __init usb_udc_init(void)
+ 		return rc;
+ 
+ 	rc = bus_register(&gadget_bus_type);
+-	if (rc)
++	if (rc) {
+ 		class_unregister(&udc_class);
+-	return rc;
++		return rc;
++	}
++
++	usb_gadget_sysctl_hdr = register_sysctl("kernel", usb_gadget_sysctls);
++
++	return 0;
+ }
+ subsys_initcall(usb_udc_init);
+ 
+ static void __exit usb_udc_exit(void)
+ {
++	if (usb_gadget_sysctl_hdr)
++		unregister_sysctl_table(usb_gadget_sysctl_hdr);
+ 	bus_unregister(&gadget_bus_type);
+ 	class_unregister(&udc_class);
+ }

@@ -65,10 +65,6 @@ on:
         description: "Mask the shell->su SELinux transition from app probes (CONFIG_SELINUX_HIDE_SHELL_SU_TRANS). Needs the hide_shell_su.c/.h patch in-tree - inert without it. Defeats checkSELinuxAccess-style root detectors; leave ON for a hardened daily driver."
         type: boolean
         default: true
-      hide_root_contexts:
-        description: "Hide the KSU/root SELinux contexts from app probes (CONFIG_SELINUX_HIDE_ROOT_CONTEXTS). EINVALs su/ksu/ksu_file (edit the list for Xposed). This is what now neutralizes the DirtySepolicy 'shell->su transition Allowed' edge (su looks invalid = stock), plus the 'context materialized' oracle. Riskier - test KSU/LSPosed. Requires hide_shell_su ON."
-        type: boolean
-        default: true
       enable_nomount:
         description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
         type: boolean
@@ -545,6 +541,37 @@ jobs:
               echo "[+] nv_guard wired (sources + Kconfig/Makefile + CONFIG_LSM)"
             else
               echo "::warning::nv_write_guard requested but kernel-patches/nv_guard sources not found; skipping"
+            fi
+          fi
+
+          # 2b-usb. USB hardening - always on. Two runtime kill switches the
+          # "USB Manager" root module flips: kernel.deny_new_usb (host side,
+          # refuses enumeration of newly inserted devices) and
+          # kernel.deny_usb_gadget (peripheral side, drops the gadget pullup so
+          # the device can't present itself to a host). Both default to 0, so
+          # the kernel stays stock until userspace writes them, and both are
+          # KMI-safe (file-scope statics + register_sysctl only - no exported
+          # symbol, signature or module-visible struct touched). Fail loud: a
+          # security gate that silently fell out is worse than a failed build.
+          if true; then
+            echo "[+] Applying USB hardening switches (deny_new_usb + deny_usb_gadget)..."
+            USBD="$GITHUB_WORKSPACE/kernel-patches/usb-hardening"
+            if [ -d "$USBD" ]; then
+              for p in "$USBD"/0001-usb-core-add-deny_new_usb-sysctl.patch \
+                       "$USBD"/0002-usb-gadget-add-deny_usb_gadget-sysctl.patch; do
+                [ -f "$p" ] || { echo "::error::USB hardening: missing $(basename "$p")"; exit 1; }
+                if patch -p1 -N -s --dry-run -i "$p" >/dev/null 2>&1; then
+                  patch -p1 -N -s --no-backup-if-mismatch -i "$p"
+                  echo "[+] applied $(basename "$p")"
+                else
+                  echo "::error::USB hardening patch did not apply cleanly: $(basename "$p")"
+                  exit 1
+                fi
+              done
+              echo "[+] USB hardening switches in place"
+            else
+              echo "::error::USB hardening requested but kernel-patches/usb-hardening not found"
+              exit 1
             fi
           fi
 
@@ -1102,6 +1129,9 @@ jobs:
           CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
         run: |
           cd kernel_workspace/common
+          # Clean uname insurance: empty .scmversion -> setlocalversion emits
+          # nothing if a build is ever stamped (stamp.bzl strip covers non-stamp).
+          : > .scmversion 2>/dev/null || true
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
           set_kconfig() {
@@ -1121,6 +1151,8 @@ jobs:
           if [ -f scripts/setlocalversion ]; then
             sed -i 's/-maybe-dirty//g; s/-dirty//g' scripts/setlocalversion
           fi
+          # the real -maybe-dirty is Kleaf's non-stamp placeholder in stamp.bzl
+          sed -i 's/-maybe-dirty//g' ../build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           set_kconfig CONFIG_LOCALVERSION_AUTO n
 
           # Custom kernel name (env var, sanitized against shell injection)
@@ -1177,9 +1209,6 @@ jobs:
           # unless the hide_shell_su.c/.h patch is in the SELinux tree.
           if [ "${{ inputs.hide_shell_su }}" = "true" ]; then
             set_kconfig CONFIG_SELINUX_HIDE_SHELL_SU_TRANS y
-          fi
-          if [ "${{ inputs.hide_root_contexts }}" = "true" ]; then
-            set_kconfig CONFIG_SELINUX_HIDE_ROOT_CONTEXTS y
           fi
 
           if [ "${{ inputs.enable_nomount }}" = "true" ]; then
@@ -1238,18 +1267,6 @@ jobs:
           cd kernel_workspace
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace/out/dist"
 
-          # Stamp a realistic build time so `uname -v` / /proc/version don't show
-          # the reproducible epoch (Thu Jan  1 00:00:00 UTC 1970) - a dead
-          # giveaway on an otherwise-stock-looking kernel. build.sh reads these
-          # directly; Bazel/Kleaf needs them forwarded via --action_env (and may
-          # still force epoch for a reproducible build, in which case the SUSFS
-          # uname "Version" spoof is the guaranteed layer). @Dev_DcS
-          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
-          export KBUILD_BUILD_USER="android-build"
-          export KBUILD_BUILD_HOST="localhost"
-          STAMP_ARGS="--action_env=KBUILD_BUILD_TIMESTAMP --action_env=KBUILD_BUILD_USER --action_env=KBUILD_BUILD_HOST"
-          echo "[+] Build timestamp: $KBUILD_BUILD_TIMESTAMP"
-
           if [ "${{ matrix.build_tool }}" = "bazel" ] || { [ "${{ matrix.build_tool }}" = "auto" ] && [ -x tools/bazel ]; }; then
             echo "[+] Building ${{ matrix.kernel_version }} with Kleaf / Bazel (page_size=${{ inputs.page_size }})..."
             if [ "${{ inputs.page_size }}" = "16k" ] && grep -q "kernel_aarch64_16k_dist" common/BUILD.bazel 2>/dev/null; then
@@ -1257,7 +1274,7 @@ jobs:
             else
               BAZEL_TARGET="//common:kernel_aarch64_dist"
             fi
-            tools/bazel run --config=fast --verbose_failures ${STAMP_ARGS} "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+            tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
           else
             echo "[+] Building ${{ matrix.kernel_version }} with legacy build/build.sh + ccache..."
             export CCACHE_DIR="$HOME/.cache/ccache"

@@ -1,0 +1,107 @@
+usb: core: add kernel.deny_new_usb host-insertion gate
+
+Adds a runtime switch at /proc/sys/kernel/deny_new_usb. While set to 1 the
+hub driver stops enumerating any USB device that newly appears on a port;
+devices already attached keep working. Flipping it needs CAP_SYS_ADMIN.
+It defaults to 0, so a kernel without a userspace controller behaves
+exactly like stock. Meant to be driven by the "USB Manager" root module to
+close the ~1s userspace gap on gadget-HAL rebind.
+
+Implementation is a single file-scope int plus a register_sysctl() call, so
+no exported symbol, signature or module-visible struct changes - the GKI
+KMI is untouched and stock vendor modules still load.
+
+Inspired by GrapheneOS' deny_new_usb (GPL-2.0).
+
+Signed-off-by: @Dev_DcS
+---
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index a81c392..b1853c9 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -34,12 +34,49 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/uaccess.h>
++#include <linux/capability.h>
++#include <linux/sysctl.h>
+ #include <asm/byteorder.h>
+ #include <trace/hooks/usb.h>
+ 
+ #include "hub.h"
+ #include "otg_productlist.h"
+ 
++/*
++ * USB host-side insertion gate. When deny_new_usb is set to 1 the hub
++ * driver stops enumerating any device that shows up on a port from that
++ * point on; devices that are already attached keep working. The knob
++ * lives at /proc/sys/kernel/deny_new_usb and only CAP_SYS_ADMIN may flip
++ * it. It defaults to 0, so an untouched system behaves exactly as before.
++ * Inspired by GrapheneOS' deny_new_usb (GPL-2.0).
++ *   -- @Dev_DcS
++ */
++static int deny_new_usb __read_mostly;
++
++static int proc_deny_new_usb(struct ctl_table *table, int write,
++		void *buffer, size_t *lenp, loff_t *ppos)
++{
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++}
++
++static struct ctl_table usb_core_sysctls[] = {
++	{
++		.procname	= "deny_new_usb",
++		.data		= &deny_new_usb,
++		.maxlen		= sizeof(deny_new_usb),
++		.mode		= 0644,
++		.proc_handler	= proc_deny_new_usb,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{ }
++};
++
++static struct ctl_table_header *usb_core_sysctl_hdr;
++
+ #define USB_VENDOR_GENESYS_LOGIC		0x05e3
+ #define USB_VENDOR_SMSC				0x0424
+ #define USB_PRODUCT_USB5534B			0x5534
+@@ -5416,6 +5453,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
+ 			goto done;
+ 		return;
+ 	}
++
++	if (deny_new_usb) {
++		dev_err(&port_dev->dev, "denied insert of USB device on port %d\n",
++			port1);
++		return;
++	}
++
+ 	if (hub_is_superspeed(hub->hdev))
+ 		unit_load = 150;
+ 	else
+@@ -6047,8 +6091,10 @@ int usb_hub_init(void)
+ 	 * over to the companion full-speed controller.
+ 	 */
+ 	hub_wq = alloc_workqueue("usb_hub_wq", WQ_FREEZABLE, 0);
+-	if (hub_wq)
++	if (hub_wq) {
++		usb_core_sysctl_hdr = register_sysctl("kernel", usb_core_sysctls);
+ 		return 0;
++	}
+ 
+ 	/* Fall through if kernel_thread failed */
+ 	usb_deregister(&hub_driver);
+@@ -6059,6 +6105,9 @@ int usb_hub_init(void)
+ 
+ void usb_hub_cleanup(void)
+ {
++	if (usb_core_sysctl_hdr)
++		unregister_sysctl_table(usb_core_sysctl_hdr);
++
+ 	destroy_workqueue(hub_wq);
+ 
+ 	/*
