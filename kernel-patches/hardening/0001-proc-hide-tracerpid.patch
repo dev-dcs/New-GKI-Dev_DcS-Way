@@ -1,0 +1,81 @@
+proc: add kernel.hide_tracerpid to spoof the TracerPid leak
+
+Apps read /proc/<pid>/status TracerPid to detect a debugger, Frida or a
+ptrace-based injection (Zygisk and friends). With kernel.hide_tracerpid = 1 that
+field always reports 0, so an unprivileged app can't tell it's being traced. Set
+it back to 0 to see tracers again. Writing needs CAP_SYS_ADMIN; it defaults to
+0, so stock behaviour is unchanged.
+
+A file-scope static plus a late_initcall register_sysctl() only; task_state() is
+static. No exported symbol, signature or module-visible struct change - the GKI
+KMI is untouched.
+
+Signed-off-by: @Dev_DcS
+---
+diff --git a/fs/proc/array.c b/fs/proc/array.c
+index 5e4f7b4..901a304 100644
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -87,6 +87,8 @@
+ #include <linux/pid_namespace.h>
+ #include <linux/prctl.h>
+ #include <linux/ptrace.h>
++#include <linux/capability.h>
++#include <linux/sysctl.h>
+ #include <linux/string_helpers.h>
+ #include <linux/user_namespace.h>
+ #include <linux/fs_struct.h>
+@@ -145,6 +147,44 @@ static inline const char *get_task_state(struct task_struct *tsk)
+ 	return task_state_array[task_state_index(tsk)];
+ }
+ 
++/*
++ * TracerPid hiding. Apps read /proc/<pid>/status TracerPid to catch a debugger,
++ * Frida or a ptrace-based injection. With kernel.hide_tracerpid = 1 that field
++ * always reports 0, so an app can't tell it's being traced; flip it back to 0
++ * (off) when you want to see tracers yourself. Needs CAP_SYS_ADMIN to change and
++ * defaults to 0, so stock behaviour is unchanged.  -- @Dev_DcS
++ */
++static int hide_tracerpid __read_mostly;
++
++static int proc_hide_tracerpid(struct ctl_table *table, int write,
++		void *buffer, size_t *lenp, loff_t *ppos)
++{
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++}
++
++static struct ctl_table proc_tracerpid_sysctls[] = {
++	{
++		.procname	= "hide_tracerpid",
++		.data		= &hide_tracerpid,
++		.maxlen		= sizeof(hide_tracerpid),
++		.mode		= 0644,
++		.proc_handler	= proc_hide_tracerpid,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{ }
++};
++
++static int __init proc_tracerpid_sysctl_init(void)
++{
++	register_sysctl("kernel", proc_tracerpid_sysctls);
++	return 0;
++}
++late_initcall(proc_tracerpid_sysctl_init);
++
+ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+ 				struct pid *pid, struct task_struct *p)
+ {
+@@ -185,6 +225,8 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+ 	seq_put_decimal_ull(m, "\nNgid:\t", ngid);
+ 	seq_put_decimal_ull(m, "\nPid:\t", pid_nr_ns(pid, ns));
+ 	seq_put_decimal_ull(m, "\nPPid:\t", ppid);
++	if (hide_tracerpid)
++		tpid = 0;
+ 	seq_put_decimal_ull(m, "\nTracerPid:\t", tpid);
+ 	seq_put_decimal_ull(m, "\nUid:\t", from_kuid_munged(user_ns, cred->uid));
+ 	seq_put_decimal_ull(m, "\t", from_kuid_munged(user_ns, cred->euid));
