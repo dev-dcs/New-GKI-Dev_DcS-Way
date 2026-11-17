@@ -18,7 +18,7 @@ on:
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "LTS sublevel: 'LTS' (latest pinned per family) or the last digits only, e.g. 162"
+        description: "LTS sublevel: 'LTS' (tip of Google's LTS branch for the family) or the last digits of an older one, e.g. 150"
         type: string
         default: "LTS"
       kernel_name:
@@ -78,7 +78,7 @@ on:
           - none
         default: monthly
       net_features:
-        description: "Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB) + NTSync (/dev/ntsync). 'both' (default), 'networking' or 'ntsync' for one, 'none' for neither."
+        description: "Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB on 6.1/6.6) + NTSync (/dev/ntsync). 'both' (default), 'networking' or 'ntsync' for one, 'none' for neither."
         type: choice
         options:
           - both
@@ -154,14 +154,15 @@ jobs:
         shell: bash
         run: |
           python3 - << 'EOF'
+          import base64
           import json
           import os
+          import re
+          import sys
+          import urllib.request
 
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
-
-          # Latest pinned LTS sublevel per family (bump as upstream moves)
-          LTS_PIN = {"6.1": "192", "6.6": "162", "6.12": "117"}
 
           all_families = [
               {"kernel_version": "android14-6.1",  "kver": "6.1",  "manifest_branch": "common-android14-6.1-lts",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
@@ -171,21 +172,64 @@ jobs:
 
           selected = all_families if req_family == "all" else [f for f in all_families if f["kernel_version"] == req_family]
 
-          def sublevel(fam):
-              # 'LTS' or blank -> pinned sublevel; bare digits -> use as-is;
-              # a full x.y.z matching this family -> its last field.
-              if not req_lts or req_lts.upper() == "LTS":
-                  return LTS_PIN[fam["kver"]]
+          # 'LTS' means the tip of the branch the manifest syncs, so there is no
+          # table of sublevels to keep bumping (the old one said 6.1.192 while
+          # Google's 6.1 branch was still on .182, and the build got relabelled
+          # to match). The number shown in the job name is read from Google's
+          # tree right now; the sync step reports whatever it really checked out.
+          def gitiles(repo, ref, path):
+              url = f"https://android.googlesource.com/{repo}/+/refs/heads/{ref}/{path}?format=TEXT"
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  return base64.b64decode(r.read()).decode("utf-8", "replace")
+
+          def branch_tip(fam):
+              try:
+                  manifest = gitiles("kernel/manifest", fam["manifest_branch"], "default.xml")
+                  proj = re.search(r'<project[^>]*path="common"[^>]*>', manifest)
+                  rev = re.search(r'revision="([^"]+)"', proj.group(0)) if proj else None
+                  rev = rev or re.search(r'<default[^>]*revision="([^"]+)"', manifest)
+                  makefile = gitiles("kernel/common", rev.group(1), "Makefile")
+                  parts = [re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
+                           for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL")]
+                  return ".".join(parts)
+              except Exception as e:  # network hiccup: not worth failing the run for a label
+                  print(f"::warning::could not read the tip of {fam['manifest_branch']} ({e}); the job name shows a placeholder")
+                  return None
+
+          def requested(fam):
+              # bare digits -> that sublevel; a full x.y.z of this family -> as given;
+              # anything else ('LTS', blank, another family's version) -> follow the tip.
               if req_lts.isdigit():
-                  return req_lts
-              if req_lts.startswith(fam["kver"] + "."):
-                  return req_lts.split(".")[-1]
-              return LTS_PIN[fam["kver"]]
+                  return f'{fam["kver"]}.{int(req_lts)}'
+              if re.fullmatch(re.escape(fam["kver"]) + r"\.\d+", req_lts):
+                  return f'{fam["kver"]}.{int(req_lts.rsplit(".", 1)[1])}'
+              return None
+
+          if req_lts and req_lts.upper() != "LTS" and not any(requested(f) for f in selected):
+              print(f"::warning::gki_lts_version '{req_lts}' is not a sublevel of the selected family; building the branch tip instead")
 
           include = []
           for fam in selected:
               entry = dict(fam)
-              entry["lts_version"] = f'{fam["kver"]}.{sublevel(fam)}'  # full, e.g. 6.6.162
+              want = requested(fam)
+              tip = branch_tip(fam)
+              # asking for a sublevel Google has not merged yet used to "work"
+              # by renaming the tip. Say no here, before an hour of sync and
+              # build - or, when several families share one number, let the
+              # ones that don't have it build their tip under its own name.
+              if want and tip and int(want.rsplit(".", 1)[1]) > int(tip.rsplit(".", 1)[1]):
+                  msg = f"{want} does not exist yet: {fam['manifest_branch']} is at {tip}."
+                  if len(selected) == 1:
+                      print(f"::error::{msg} Use 'LTS' or a sublevel up to {tip.rsplit('.', 1)[1]}.")
+                      sys.exit(1)
+                  print(f"::warning::{msg} Building {tip} for this family.")
+                  want = None
+              if want:
+                  entry["lts_version"] = want            # full, e.g. 6.6.150
+                  entry["follow_tip"] = "false"
+              else:
+                  entry["lts_version"] = tip or f'{fam["kver"]}-LTS'
+                  entry["follow_tip"] = "true"
               entry["root_variant"] = "FinaSU"
               include.append(entry)
 
@@ -331,23 +375,80 @@ jobs:
           CURRENT_SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
           REQ_LTS="${{ matrix.lts_version }}"
 
-          if [ -n "$REQ_LTS" ] && [ "$REQ_LTS" != "lts" ]; then
-            TARGET_SUBLEVEL=$(echo "$REQ_LTS" | cut -d. -f3)
-            if [ -n "$TARGET_SUBLEVEL" ] && [ "$CURRENT_SUBLEVEL" != "$TARGET_SUBLEVEL" ]; then
-              git fetch --unshallow aosp || true
-              MATCH_COMMIT=$(git log --grep="Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}" -n 1 --format="%H" || true)
-              if [ -n "$MATCH_COMMIT" ]; then
-                echo "[+] Checking out exact commit for Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}: $MATCH_COMMIT"
-                git checkout "$MATCH_COMMIT"
-              else
-                echo "[!] Pinning SUBLEVEL=${TARGET_SUBLEVEL} in Makefile"
-                sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${TARGET_SUBLEVEL}/" Makefile
+          # The commit that brought sublevel $1 into this branch: the oldest
+          # first-parent commit whose Makefile says so ("Merge 6.x.N into
+          # android..-lts"). Only answers once the history on disk reaches
+          # below N - on a shallow clone the first hit could be any later
+          # commit of that sublevel.
+          sublevel_commit() {
+            local want="$1" hit="" below="" c s
+            while read -r c; do
+              s="$(git show "$c:Makefile" 2>/dev/null | sed -n 's/^SUBLEVEL = //p' | head -n1)"
+              case "$s" in ''|*[!0-9]*) continue ;; esac
+              if [ "$s" -eq "$want" ]; then
+                hit="$c"
+              elif [ "$s" -lt "$want" ]; then
+                below=1
+                break
               fi
-              CURRENT_SUBLEVEL="$TARGET_SUBLEVEL"
+            done < <(git log --first-parent --format=%H -- Makefile)
+            if [ -n "$below" ] || [ "$(git rev-parse --is-shallow-repository)" = "false" ]; then
+              echo "$hit"
+              return 0
+            fi
+            return 1
+          }
+
+          # 'LTS' builds whatever the manifest synced. A specific sublevel is
+          # checked out for real or the run stops: the Makefile is never edited
+          # to say a version the source isn't (that is how a 6.1.182 tree used
+          # to ship as "6.1.192").
+          if [ "${{ matrix.follow_tip }}" != "true" ]; then
+            TARGET_SUBLEVEL="${REQ_LTS##*.}"
+            case "$TARGET_SUBLEVEL" in
+              ''|*[!0-9]*) echo "::error::can't read a sublevel out of '$REQ_LTS'"; exit 1 ;;
+            esac
+            if [ "$TARGET_SUBLEVEL" -gt "$CURRENT_SUBLEVEL" ]; then
+              echo "::error::${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL} does not exist yet: ${{ matrix.manifest_branch }} is at ${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}. Use 'LTS' or a sublevel up to ${CURRENT_SUBLEVEL}."
+              exit 1
+            fi
+            if [ "$TARGET_SUBLEVEL" -lt "$CURRENT_SUBLEVEL" ]; then
+              REMOTE="$(git remote | head -n1)"
+              COMMON_REV="$(cd .. && repo forall common -c 'echo "$REPO_RREV"' 2>/dev/null | head -n1 || true)"
+              [ -n "$COMMON_REV" ] || COMMON_REV="${{ matrix.manifest_branch }}"
+              COMMON_REV="${COMMON_REV#common-}"
+              # repo left a depth-1 clone. Walk back in steps instead of pulling
+              # the whole of kernel/common: 300 deep already covers ~20 sublevels.
+              MATCH_COMMIT=""
+              for depth in have 300 1500 6000 all; do
+                case "$depth" in
+                  have) ;;
+                  all)  git fetch -q --unshallow "${REMOTE:-aosp}" "$COMMON_REV" || true ;;
+                  *)    git fetch -q --depth="$depth" "${REMOTE:-aosp}" "$COMMON_REV" || true ;;
+                esac
+                if MATCH_COMMIT="$(sublevel_commit "$TARGET_SUBLEVEL")"; then
+                  break
+                fi
+              done
+              if [ -z "$MATCH_COMMIT" ]; then
+                echo "::error::no commit on $COMMON_REV carries ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL} (the branch may have started later than that)"
+                exit 1
+              fi
+              echo "[+] ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL} -> $(git log -1 --format='%h %s' "$MATCH_COMMIT")"
+              git checkout -q "$MATCH_COMMIT"
+              CURRENT_SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
+              if [ "$CURRENT_SUBLEVEL" != "$TARGET_SUBLEVEL" ]; then
+                echo "::error::checked out $MATCH_COMMIT but its Makefile says SUBLEVEL=$CURRENT_SUBLEVEL, not $TARGET_SUBLEVEL"
+                exit 1
+              fi
             fi
           fi
 
           RESOLVED_KVER="${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
+          if [ "$REQ_LTS" != "$RESOLVED_KVER" ]; then
+            # only possible on 'LTS' when the branch moved between the two jobs
+            echo "::notice::job name says $REQ_LTS, the tree that was synced is $RESOLVED_KVER - the artifacts carry the real one"
+          fi
           echo "resolved_kver=${RESOLVED_KVER}" >> "$GITHUB_OUTPUT"
           echo "resolved_sublevel=${CURRENT_SUBLEVEL}" >> "$GITHUB_OUTPUT"
           echo "[*] Building kernel version: ${RESOLVED_KVER} (${{ matrix.kernel_version }})"
@@ -1261,6 +1362,13 @@ jobs:
             KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
             if [ -n "$KN" ]; then
               set_kconfig CONFIG_LOCALVERSION "\"-$KN\""
+              # 6.6+ Kleaf merges a page-size fragment on top of the defconfig
+              # for the 16k kernel, and that fragment blanks CONFIG_LOCALVERSION
+              # again - so the name has to go in there too or 16k builds lose it
+              PS_FRAG="../build/kernel/kleaf/impl/defconfig/arm64_16k_defconfig"
+              if grep -qs '^CONFIG_LOCALVERSION=' "$PS_FRAG"; then
+                sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-$KN\"/" "$PS_FRAG"
+              fi
               echo "[+] Kernel name: -$KN"
             fi
           fi
@@ -1332,7 +1440,11 @@ jobs:
             # phone already carries in system_dlkm); CIFS=y drags netfs into
             # the image, the module is never produced and the build stops on
             # it. Where that's the case keep the stock module set and leave
-            # CIFS out.
+            # CIFS out. Building netfs in instead was considered and dropped:
+            # it means cutting netfs.ko out of Google's module list and
+            # shipping an image whose module set no longer matches the
+            # system_dlkm on the phone, all for an in-kernel SMB client that
+            # apps already replace in userspace. Not worth a boot risk.
             if grep -q 'fs/netfs/netfs.ko' modules.bzl 2>/dev/null && \
                grep -q 'select NETFS_SUPPORT' fs/smb/client/Kconfig 2>/dev/null; then
               echo "[i] CIFS left out on ${{ matrix.kernel_version }}: it would turn the GKI module netfs.ko into a built-in"
@@ -1403,11 +1515,22 @@ jobs:
 
           if [ "${{ matrix.build_tool }}" = "bazel" ] || { [ "${{ matrix.build_tool }}" = "auto" ] && [ -x tools/bazel ]; }; then
             echo "[+] Building ${{ matrix.kernel_version }} with Kleaf / Bazel (page_size=${{ inputs.page_size }})..."
-            if [ "${{ inputs.page_size }}" = "16k" ] && grep -q "kernel_aarch64_16k_dist" common/BUILD.bazel 2>/dev/null; then
-              BAZEL_TARGET="//common:kernel_aarch64_16k_dist"
-            else
-              BAZEL_TARGET="//common:kernel_aarch64_dist"
+            # The 16k kernel is a target of its own. Its _dist rule is made by a
+            # macro, so that name is written nowhere and the old grep for
+            # "kernel_aarch64_16k_dist" never matched: 16k quietly built 4k.
+            # Look for the kernel target instead - older Kleaf declares it in
+            # common_kernels.bzl, the 6.12 one in common/BUILD.bazel.
+            KTARGET="kernel_aarch64"
+            if [ "${{ inputs.page_size }}" = "16k" ]; then
+              if grep -qs '"kernel_aarch64_16k"' common/BUILD.bazel build/kernel/kleaf/common_kernels.bzl; then
+                KTARGET="kernel_aarch64_16k"
+              else
+                echo "::error::page_size=16k: this tree has no kernel_aarch64_16k target, and a 4k kernel under a 16k label won't boot"
+                exit 1
+              fi
             fi
+            echo "KTARGET=$KTARGET" >> "$GITHUB_ENV"
+            BAZEL_TARGET="//common:${KTARGET}_dist"
             # The dist target changed under the hood: older Kleaf (6.1 / 6.6
             # manifests) uses copy_to_dist_dir and takes --dist_dir, the one
             # android16-6.12 syncs uses rules_pkg's pkg_install, which only
@@ -1421,11 +1544,32 @@ jobs:
             fi
             tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- "$DIST_FLAG"
           else
+            if [ "${{ inputs.page_size }}" = "16k" ]; then
+              echo "::error::page_size=16k needs the Kleaf build; build.sh here only does the default 4k config"
+              exit 1
+            fi
             echo "[+] Building ${{ matrix.kernel_version }} with legacy build/build.sh + ccache..."
             export CCACHE_DIR="$HOME/.cache/ccache"
             export USE_CCACHE=1
             ccache -M 12G || true
             LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 DIST_DIR="$GITHUB_WORKSPACE/kernel_workspace/out/dist" build/build.sh
+          fi
+
+          # Trust the Image, not the label: the arm64 header carries the page
+          # size it was built for (flags at offset 24, bits 1-2; "ARMd" at 56).
+          IMG="out/dist/Image"
+          [ -f "$IMG" ] || IMG="bazel-bin/common/${KTARGET:-kernel_aarch64}/Image"
+          if [ -f "$IMG" ] && [ "$(od -An -tx4 -j56 -N4 "$IMG" | tr -d ' ')" = "644d5241" ]; then
+            case $(( ($(od -An -tu8 -j24 -N8 "$IMG" | tr -d ' ') >> 1) & 3 )) in
+              1) BUILT_PS=4k ;; 2) BUILT_PS=16k ;; 3) BUILT_PS=64k ;; *) BUILT_PS="" ;;
+            esac
+            if [ -n "$BUILT_PS" ]; then
+              echo "[i] Image page size: $BUILT_PS"
+              if [ "$BUILT_PS" != "${{ inputs.page_size }}" ]; then
+                echo "::error::asked for ${{ inputs.page_size }} pages but the Image that came out is $BUILT_PS"
+                exit 1
+              fi
+            fi
           fi
 
       - name: Build & Package Mosey wonder KSU Module (out-of-tree `.ko`)
@@ -1441,12 +1585,12 @@ jobs:
 
           # finished .config, Image and symvers, in either layout (bazel / build.sh)
           cfg=""
-          for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do
+          for c in bazel-bin/common/${KTARGET:-kernel_aarch64}_config/out_dir/.config out/dist/.config out/.config; do
             [ -f "$c" ] && { cfg="$c"; break; }
           done
           [ -n "$cfg" ] || cfg="$(find bazel-bin/common out -maxdepth 4 -name .config -type f 2>/dev/null | head -n1 || true)"
           img=""
-          for i in out/dist/Image bazel-bin/common/kernel_aarch64/Image; do
+          for i in out/dist/Image bazel-bin/common/${KTARGET:-kernel_aarch64}/Image; do
             [ -f "$i" ] && { img="$i"; break; }
           done
           [ -n "$img" ] || img="$(find . -maxdepth 5 -type f -name Image 2>/dev/null | head -n1 || true)"
@@ -1489,7 +1633,7 @@ jobs:
 
           # vmlinux CRCs from the real build; cfg80211 symbols stay unversioned
           # on purpose (they resolve against the phone's own cfg80211.ko)
-          sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
+          sv="$(find "bazel-bin/common/${KTARGET:-kernel_aarch64}" out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
           if [ -n "$sv" ]; then cp "$sv" "$OBJ/Module.symvers"; else echo "::warning::Mosey: no symvers, core symbols unversioned"; fi
 
           "${mk[@]}" M="$SRC" KBUILD_MODPOST_WARN=1 modules
@@ -1635,8 +1779,8 @@ jobs:
 
           if [ -f kernel_workspace/out/dist/Image ]; then
             cp -f kernel_workspace/out/dist/Image AnyKernel3/Image
-          elif [ -f kernel_workspace/bazel-bin/common/kernel_aarch64/Image ]; then
-            cp -f kernel_workspace/bazel-bin/common/kernel_aarch64/Image AnyKernel3/Image
+          elif [ -f kernel_workspace/bazel-bin/common/${KTARGET:-kernel_aarch64}/Image ]; then
+            cp -f kernel_workspace/bazel-bin/common/${KTARGET:-kernel_aarch64}/Image AnyKernel3/Image
           else
             FOUND_IMG=$(find kernel_workspace -type f -name "Image" | head -n 1 || true)
             if [ -n "$FOUND_IMG" ]; then
@@ -1650,7 +1794,11 @@ jobs:
           fi
 
           KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
-          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}-FinaSU-Mosey-AnyKernel3.zip"
+          # a 16k zip flashed on a 4k phone (or the other way round) does not
+          # boot, so the odd one out says what it is
+          PS_TAG=""
+          [ "${{ inputs.page_size }}" = "16k" ] && PS_TAG="-16k"
+          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}${PS_TAG}-FinaSU-Mosey-AnyKernel3.zip"
           (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .)
 
           cat << EOF > BuildInfo.txt
@@ -1674,7 +1822,7 @@ jobs:
       - name: Upload AnyKernel3 ZIP Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey-AnyKernel3"
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}${{ inputs.page_size == '16k' && '-16k' || '' }}-${{ matrix.root_variant }}-Mosey-AnyKernel3"
           path: "*-AnyKernel3.zip"
 
       - name: Upload BuildInfo & Mosey Companion Bundle
@@ -1740,9 +1888,9 @@ jobs:
           if [ ! -f "$REK_SRC/Makefile" ]; then echo "::warning::Re-Kernel: vendored source missing, skipping (kernel zip unaffected)"; exit 0; fi
           OBJ="$RUNNER_TEMP/rek_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
           REK="$GITHUB_WORKSPACE/rekernel_build"; rm -rf "$REK"; mkdir -p "$REK"; cp -a "$REK_SRC/." "$REK/"
-          cfg=""; for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do [ -f "$c" ] && cfg="$c" && break; done
+          cfg=""; for c in bazel-bin/common/${KTARGET:-kernel_aarch64}_config/out_dir/.config out/dist/.config out/.config; do [ -f "$c" ] && cfg="$c" && break; done
           [ -n "$cfg" ] || cfg="$(find . -maxdepth 5 -type f -name .config 2>/dev/null | head -n1 || true)"
-          img=""; for i in out/dist/Image bazel-bin/common/kernel_aarch64/Image; do [ -f "$i" ] && img="$i" && break; done
+          img=""; for i in out/dist/Image bazel-bin/common/${KTARGET:-kernel_aarch64}/Image; do [ -f "$i" ] && img="$i" && break; done
           [ -n "$img" ] || img="$(find . -maxdepth 5 -type f -name Image 2>/dev/null | head -n1 || true)"
           if [ -z "$cfg" ] || [ -z "$img" ]; then echo "::warning::Re-Kernel: no .config/Image, skipping (kernel zip unaffected)"; exit 0; fi
           krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"; [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
@@ -1760,7 +1908,7 @@ jobs:
           "${mk[@]}" modules_prepare || { echo "::warning::Re-Kernel: modules_prepare failed, skipping"; exit 0; }
           echo "$krel" > "$OBJ/include/config/kernel.release"
           printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
-          sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
+          sv="$(find "bazel-bin/common/${KTARGET:-kernel_aarch64}" out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
           [ -n "$sv" ] && cp "$sv" "$OBJ/Module.symvers" || echo "::warning::Re-Kernel: no symvers, core symbols unversioned"
           if ! "${mk[@]}" M="$REK" KBUILD_MODPOST_WARN=1 modules; then echo "::warning::Re-Kernel: module build failed (vendor-hook mismatch on this KMI?); skipping, kernel zip unaffected"; exit 0; fi
           ko="$(find "$REK" -name 'rekernel*.ko' -type f | head -n1 || true)"

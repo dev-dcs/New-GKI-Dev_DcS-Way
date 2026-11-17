@@ -287,8 +287,10 @@ jobs:
                 echo "[+] Checking out exact commit for Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}: $MATCH_COMMIT"
                 git checkout "$MATCH_COMMIT"
               else
-                echo "[!] Pinning SUBLEVEL=${TARGET_SUBLEVEL} in Makefile"
-                sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${TARGET_SUBLEVEL}/" Makefile
+                # not in this branch: build the tip under its real number rather
+                # than rewrite the Makefile to a version the source isn't
+                echo "::warning::${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL} is not in this branch - building the tip, ${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
+                TARGET_SUBLEVEL="$CURRENT_SUBLEVEL"
               fi
               CURRENT_SUBLEVEL="$TARGET_SUBLEVEL"
             fi
@@ -848,7 +850,7 @@ jobs:
 
           if [ "${{ matrix.build_tool }}" = "bazel" ] || { [ "${{ matrix.build_tool }}" = "auto" ] && [ -x tools/bazel ]; }; then
             echo "[+] Building ${{ matrix.kernel_version }} with Kleaf / Bazel (page_size=${{ inputs.page_size }})..."
-            if [ "${{ inputs.page_size }}" = "16k" ] && grep -q "kernel_aarch64_16k_dist" common/BUILD.bazel 2>/dev/null; then
+            if [ "${{ inputs.page_size }}" = "16k" ] && grep -qs '"kernel_aarch64_16k"' common/BUILD.bazel build/kernel/kleaf/common_kernels.bzl; then
               BAZEL_TARGET="//common:kernel_aarch64_16k_dist"
             else
               BAZEL_TARGET="//common:kernel_aarch64_dist"
