@@ -370,16 +370,25 @@ jobs:
           # no git-checkout are needed and the build is reproducible / outage-proof.
           # Fall back to cloning + pinning upstream only if it is not vendored.
           V_SUSFS="$GITHUB_WORKSPACE/sources/susfs4ksu"
-          if [ -d "$V_SUSFS/kernel_patches" ]; then
-            echo "[+] Using vendored susfs4ksu from repo (already pinned to the FinaSU commit)"
+          # The kernel-side patch is one file per KMI; fs/susfs.c and the headers
+          # are the same for all three. Only take the vendored copy when it
+          # really has this family's patch.
+          SUSFS_KPATCH="50_add_susfs_in_${{ matrix.susfs_branch }}.patch"
+          if [ -f "$V_SUSFS/kernel_patches/$SUSFS_KPATCH" ]; then
+            echo "[+] Using vendored susfs4ksu from repo (FinaSU-pinned v2.3.0, $SUSFS_KPATCH)"
             rm -rf susfs4ksu && cp -a "$V_SUSFS" susfs4ksu
           else
-            git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
-              git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://github.com/ShirkNeko/susfs4ksu.git susfs4ksu || true
+            git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || true
             # FinaSU pins SUSFS to a specific commit (its hook model differs from the
             # branch tip; HEAD panics in early boot). Pin it - see FinaSU builtin docs.
-            SUSFS_PIN="4a4cb1be85a4694372d3efb9420de69982eac29a"
-            if [ -d susfs4ksu/.git ]; then
+            # Same v2.3.0 commit on each branch (pushed together, 2026-10-19).
+            case "${{ matrix.susfs_branch }}" in
+              gki-android14-6.1)  SUSFS_PIN="b57ed1998b82c4e3a2a81cdbf11172a560979c40" ;;
+              gki-android15-6.6)  SUSFS_PIN="4a4cb1be85a4694372d3efb9420de69982eac29a" ;;
+              gki-android16-6.12) SUSFS_PIN="9c9f19d8395693327c78df36569b44e94c187b8a" ;;
+              *)                  SUSFS_PIN="" ;;
+            esac
+            if [ -d susfs4ksu/.git ] && [ -n "$SUSFS_PIN" ]; then
               git -C susfs4ksu fetch --unshallow 2>/dev/null || git -C susfs4ksu fetch --depth=100 origin "${{ matrix.susfs_branch }}" 2>/dev/null || true
               if git -C susfs4ksu checkout -q "$SUSFS_PIN" 2>/dev/null; then
                 echo "[+] SUSFS pinned to FinaSU-compatible commit ${SUSFS_PIN:0:10}"
@@ -465,16 +474,29 @@ jobs:
           KVER_SHORT="${{ matrix.kver }}"
           SUBLEVEL="${{ steps.sync-kernel.outputs.resolved_sublevel }}"
 
-          # 1. SUSFS (FinaSU carries susfs natively: kernel-side 50_add only)
+          # 1. SUSFS (FinaSU carries susfs natively: kernel-side 50_add only).
+          # Only the patch written for this KMI goes in. A 6.6 patch on a 6.12
+          # tree "applies" with enough fuzz and leaves rejects behind, and the
+          # result is a kernel missing some of its hooks - so a missing patch
+          # or any reject stops the build here instead.
           if [ "${{ inputs.enable_susfs }}" = "true" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
+            SUSFS_PATCH="$SUSFS_DIR/kernel_patches/50_add_susfs_in_${{ matrix.susfs_branch }}.patch"
+            if [ ! -f "$SUSFS_PATCH" ]; then
+              echo "::error::SUSFS: no kernel patch for ${{ matrix.susfs_branch }} (expected $(basename "$SUSFS_PATCH"))"
+              exit 1
+            fi
             echo "[+] Copying SUSFS fs/ and include/linux/ sources..."
             cp -rf "$SUSFS_DIR/kernel_patches/fs/"* common/fs/ || true
             cp -rf "$SUSFS_DIR/kernel_patches/include/linux/"* common/include/linux/ || true
 
             cd common
-            for p in "$SUSFS_DIR"/kernel_patches/50_add_susfs_in_gki-*.patch; do
-              [ -f "$p" ] && patch -p1 --forward --fuzz=3 < "$p" || true
-            done
+            find . -name "*.rej" -delete || true
+            echo "[+] Applying $(basename "$SUSFS_PATCH")"
+            if ! patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH"; then
+              echo "::error::SUSFS patch did not apply cleanly on ${{ matrix.kernel_version }} $KVER_SHORT.$SUBLEVEL"
+              find . -name "*.rej" | sed 's/^/  reject: /'
+              exit 1
+            fi
 
             # utf8-norm bypass fix (6.1+ variant)
             U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch"
@@ -488,19 +510,40 @@ jobs:
           # 2. Baseband Guard (BBG) - always on
           if true; then
             echo "[+] Integrating Baseband Guard (BBG)..."
-            # Vendored Baseband-guard (pinned); a no-remote 'git init' makes its
-            # setup.sh wire the tree from the vendored files without cloning.
             BV="$GITHUB_WORKSPACE/sources/baseband-guard"
             if [ -d "$BV" ]; then
+              # Vendored + pinned copy, wired by hand: the same three things
+              # upstream's setup.sh does on a DEFINE_LSM tree (symlink, Makefile
+              # line, Kconfig source). setup.sh expects a checkout it can pull
+              # and only gave "pathspec 'main'" / "no tracking information"
+              # noise against a vendored directory.
               echo "[+] Using vendored Baseband-guard from repo (pinned)"
-              rm -rf Baseband-guard && cp -a "$BV" Baseband-guard
+              rm -rf Baseband-guard security/baseband-guard
+              cp -a "$BV" Baseband-guard
+              # its Makefile asks git for a version string; keep that lookup
+              # inside this directory so it can't pick up the kernel's own repo
               git -C Baseband-guard init -q 2>/dev/null || true
-              bash Baseband-guard/setup.sh || true
+              git -C Baseband-guard remote add origin https://github.com/vc-teahouse/Baseband-guard 2>/dev/null || true
+              ln -sfn ../Baseband-guard security/baseband-guard
+              grep -q 'baseband-guard/' security/Makefile || \
+                printf '\nobj-$(CONFIG_BBG) += baseband-guard/\n' >> security/Makefile
+              grep -q 'security/baseband-guard/Kconfig' security/Kconfig || \
+                sed -i 's#^source "security/keys/Kconfig"#&\nsource "security/baseband-guard/Kconfig"#' security/Kconfig
+              if [ -f security/baseband-guard/baseband_guard.c ] && grep -q 'security/baseband-guard/Kconfig' security/Kconfig; then
+                echo "[+] Baseband-guard wired (sources + Kconfig/Makefile)"
+              else
+                echo "::error::Baseband-guard could not be wired into security/"
+                exit 1
+              fi
             else
               curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
             fi
-            find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
-            # setup.sh adds the source but not the LSM list entry; add it here.
+            # wild_patches/common/bbg/ is left out on purpose: both files are for
+            # the OnePlus "efisp" bootloader exploit (an AnyKernel3 flash menu and
+            # an abl/efisp allowlist keyed on oplusboot.secure_user_mode). Nothing
+            # in there is for a Pixel, and the old blanket `find *bbg*.patch` fed
+            # the AnyKernel3 one to the kernel tree, where it can never apply.
+            # The LSM list entry is separate from the source wiring; add it here.
             if [ -d security/baseband-guard ]; then
               sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
               DEF="arch/arm64/configs/gki_defconfig"
@@ -541,6 +584,19 @@ jobs:
               echo "[+] nv_guard wired (sources + Kconfig/Makefile + CONFIG_LSM)"
             else
               echo "::warning::nv_write_guard requested but kernel-patches/nv_guard sources not found; skipping"
+            fi
+          fi
+
+          # 2b-slots. From 6.12 the LSM core sizes its static-call pool from the
+          # in-tree LSMs only (include/linux/lsm_count.h). Without a slot each,
+          # the two guards above compile and then never run ("out of LSM static
+          # calls!?" at boot) and bpf falls off the end of CONFIG_LSM with them.
+          # No-op on 6.1 / 6.6. Fail loud: a guard that silently isn't there is
+          # worse than a failed build.
+          if [ -d security/baseband-guard ] || [ -f security/nv_guard/nv_guard.c ]; then
+            if ! sh "$GITHUB_WORKSPACE/kernel-patches/lsm-slots/add-lsm-slots.sh" .; then
+              echo "::error::could not reserve LSM slots for Baseband-guard / nv_guard"
+              exit 1
             fi
           fi
 
@@ -1271,7 +1327,18 @@ jobs:
             set_kconfig CONFIG_IP_SET_MAX 256
             set_kconfig CONFIG_NETFILTER_XT_TARGET_HL y
             set_kconfig CONFIG_NETFILTER_XT_TARGET_CONNMARK y
-            set_kconfig CONFIG_CIFS y
+            # From 6.8 CIFS selects NETFS_SUPPORT. On android16-6.12 netfs.ko is
+            # one of the GKI modules Kleaf has to hand back (and the one the
+            # phone already carries in system_dlkm); CIFS=y drags netfs into
+            # the image, the module is never produced and the build stops on
+            # it. Where that's the case keep the stock module set and leave
+            # CIFS out.
+            if grep -q 'fs/netfs/netfs.ko' modules.bzl 2>/dev/null && \
+               grep -q 'select NETFS_SUPPORT' fs/smb/client/Kconfig 2>/dev/null; then
+              echo "[i] CIFS left out on ${{ matrix.kernel_version }}: it would turn the GKI module netfs.ko into a built-in"
+            else
+              set_kconfig CONFIG_CIFS y
+            fi
           fi
 
           if [ "${{ inputs.enable_bpf }}" = "true" ]; then
@@ -1305,6 +1372,28 @@ jobs:
             fi
           done
 
+          # The Kleaf that android16-6.12 syncs (main-kernel-2025) ignores the
+          # check_defconfig line removed from build.config above: common_kernel()
+          # itself runs `make savedefconfig` and diffs it against gki_defconfig
+          # ("minimized"), so every option appended here fails the build with
+          # "savedefconfig does not match". Switch that check off for the GKI
+          # targets - the attribute is the supported way, the default in
+          # common_kernels.bzl is flipped too in case the attribute moves.
+          # Older trees (define_common_kernels) have neither and are untouched.
+          if [ -f BUILD.bazel ] && grep -q '^common_kernel($' BUILD.bazel; then
+            for t in kernel_aarch64 kernel_aarch64_16k; do
+              if grep -q "^    name = \"$t\",\$" BUILD.bazel && \
+                 ! sed -n "/^    name = \"$t\",\$/,/^)/p" BUILD.bazel | grep -q 'check_defconfig'; then
+                sed -i "/^    name = \"$t\",\$/a\\    check_defconfig = \"disabled\"," BUILD.bazel
+                echo "[+] Kleaf defconfig check disabled for $t"
+              fi
+            done
+          fi
+          KLEAF_CK="../build/kernel/kleaf/common_kernels.bzl"
+          if [ -f "$KLEAF_CK" ]; then
+            sed -i 's/"match" if pre_defconfig_fragments else "minimized"/"disabled"/' "$KLEAF_CK" || true
+          fi
+
 
       - name: Compile Kernel (${{ matrix.kernel_version }} - Auto Bazel / build.sh Dispatch)
         shell: bash
@@ -1319,7 +1408,18 @@ jobs:
             else
               BAZEL_TARGET="//common:kernel_aarch64_dist"
             fi
-            tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+            # The dist target changed under the hood: older Kleaf (6.1 / 6.6
+            # manifests) uses copy_to_dist_dir and takes --dist_dir, the one
+            # android16-6.12 syncs uses rules_pkg's pkg_install, which only
+            # knows --destdir and exits on anything else - after the whole
+            # kernel has already been built.
+            DIST_OUT="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+            if grep -q 'pkg_install' build/kernel/kleaf/common_kernels.bzl 2>/dev/null; then
+              DIST_FLAG="--destdir=$DIST_OUT"
+            else
+              DIST_FLAG="--dist_dir=$DIST_OUT"
+            fi
+            tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- "$DIST_FLAG"
           else
             echo "[+] Building ${{ matrix.kernel_version }} with legacy build/build.sh + ccache..."
             export CCACHE_DIR="$HOME/.cache/ccache"

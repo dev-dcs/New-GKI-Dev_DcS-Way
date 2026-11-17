@@ -23,19 +23,20 @@ untouched. Applies across android14-6.1 / android15-6.6 / android16-6.12.
 Signed-off-by: @Dev_DcS
 ---
 diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
-index e28fea6..c97f347 100644
+index e28fea6..43638b6 100644
 --- a/drivers/usb/gadget/udc/core.c
 +++ b/drivers/usb/gadget/udc/core.c
-@@ -17,6 +17,8 @@
+@@ -17,6 +17,9 @@
  #include <linux/dma-mapping.h>
  #include <linux/sched/task_stack.h>
  #include <linux/workqueue.h>
 +#include <linux/capability.h>
 +#include <linux/sysctl.h>
++#include <linux/version.h>
  
  #include <linux/usb/ch9.h>
  #include <linux/usb/gadget.h>
-@@ -68,6 +70,15 @@ static LIST_HEAD(udc_list);
+@@ -68,6 +71,15 @@ static LIST_HEAD(udc_list);
  /* Protects udc_list, udc->driver, driver->is_bound, and related calls */
  static DEFINE_MUTEX(udc_lock);
  
@@ -51,7 +52,7 @@ index e28fea6..c97f347 100644
  /* ------------------------------------------------------------------------- */
  
  /**
-@@ -704,6 +715,11 @@ static int usb_gadget_connect_locked(struct usb_gadget *gadget)
+@@ -704,6 +716,11 @@ static int usb_gadget_connect_locked(struct usb_gadget *gadget)
  {
  	int ret = 0;
  
@@ -63,7 +64,7 @@ index e28fea6..c97f347 100644
  	if (!gadget->ops->pullup) {
  		ret = -EOPNOTSUPP;
  		goto out;
-@@ -1134,7 +1150,7 @@ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
+@@ -1134,7 +1151,7 @@ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
  /* Acquire connect_lock before calling this function. */
  static int usb_udc_connect_control_locked(struct usb_udc *udc) __must_hold(&udc->connect_lock)
  {
@@ -72,11 +73,16 @@ index e28fea6..c97f347 100644
  		return usb_gadget_connect_locked(udc->gadget);
  	else
  		return usb_gadget_disconnect_locked(udc->gadget);
-@@ -1904,6 +1920,57 @@ static const struct bus_type gadget_bus_type = {
+@@ -1904,6 +1921,64 @@ static const struct bus_type gadget_bus_type = {
  	.match = gadget_match_driver,
  };
  
++/* 6.11 made the handler's table argument const */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++static int proc_deny_usb_gadget(const struct ctl_table *table, int write,
++#else
 +static int proc_deny_usb_gadget(struct ctl_table *table, int write,
++#endif
 +		void *buffer, size_t *lenp, loff_t *ppos)
 +{
 +	struct usb_udc *udc;
@@ -117,7 +123,9 @@ index e28fea6..c97f347 100644
 +		.extra1		= SYSCTL_ZERO,
 +		.extra2		= SYSCTL_ONE,
 +	},
-+	{ }
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++	{ }	/* older trees still walk to an empty entry */
++#endif
 +};
 +
 +static int __init usb_gadget_sysctl_init(void)

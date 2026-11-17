@@ -17,15 +17,16 @@ Inspired by GrapheneOS' deny_new_usb (GPL-2.0).
 Signed-off-by: @Dev_DcS
 ---
 diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
-index 090b3a7..dad8544 100644
+index 090b3a7..d6081b1 100644
 --- a/drivers/usb/core/hub.c
 +++ b/drivers/usb/core/hub.c
-@@ -40,6 +40,42 @@
+@@ -40,6 +40,50 @@
  #include "phy.h"
  #include "otg_productlist.h"
  
 +#include <linux/capability.h>
 +#include <linux/sysctl.h>
++#include <linux/version.h>
 +
 +/*
 + * USB host-side insertion gate. When deny_new_usb is set to 1 the hub
@@ -38,7 +39,12 @@ index 090b3a7..dad8544 100644
 + */
 +static int deny_new_usb __read_mostly;
 +
++/* 6.11 made the handler's table argument const */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++static int proc_deny_new_usb(const struct ctl_table *table, int write,
++#else
 +static int proc_deny_new_usb(struct ctl_table *table, int write,
++#endif
 +		void *buffer, size_t *lenp, loff_t *ppos)
 +{
 +	if (write && !capable(CAP_SYS_ADMIN))
@@ -57,13 +63,15 @@ index 090b3a7..dad8544 100644
 +		.extra1		= SYSCTL_ZERO,
 +		.extra2		= SYSCTL_ONE,
 +	},
-+	{ }
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++	{ }	/* older trees still walk to an empty entry */
++#endif
 +};
 +
  #define USB_VENDOR_GENESYS_LOGIC		0x05e3
  #define USB_VENDOR_SMSC				0x0424
  #define USB_PRODUCT_USB5534B			0x5534
-@@ -5445,6 +5481,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
+@@ -5445,6 +5489,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
  			goto done;
  		return;
  	}
@@ -77,7 +85,7 @@ index 090b3a7..dad8544 100644
  	if (hub_is_superspeed(hub->hdev))
  		unit_load = 150;
  	else
-@@ -6076,8 +6119,10 @@ int usb_hub_init(void)
+@@ -6076,8 +6127,10 @@ int usb_hub_init(void)
  	 * over to the companion full-speed controller.
  	 */
  	hub_wq = alloc_workqueue("usb_hub_wq", WQ_FREEZABLE, 0);

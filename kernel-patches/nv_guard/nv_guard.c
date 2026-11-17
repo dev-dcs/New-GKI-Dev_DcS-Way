@@ -29,6 +29,7 @@
 #include <linux/moduleparam.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
+#include <linux/version.h>
 
 static int nvg_enforce = 1;
 static bool nvg_unlocked;
@@ -114,9 +115,25 @@ static struct security_hook_list nvg_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(inode_rename, nvg_inode_rename),
 };
 
+/*
+ * 6.8 swapped the name string in security_add_hooks() for a struct lsm_id.
+ * The id only has to be unique among the LSMs built into this image:
+ * upstream ones sit in the low hundreds and Baseband-guard took 995.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+static const struct lsm_id nvg_lsmid = {
+	.name = "nv_guard",
+	.id = 994,
+};
+#endif
+
 static int __init nvg_init(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	security_add_hooks(nvg_hooks, ARRAY_SIZE(nvg_hooks), &nvg_lsmid);
+#else
 	security_add_hooks(nvg_hooks, ARRAY_SIZE(nvg_hooks), "nv_guard");
+#endif
 	pr_info("nv_guard: watching [%s] (enforce=%d unlocked=%d)\n",
 		nvg_names, nvg_enforce, nvg_unlocked);
 	return 0;
