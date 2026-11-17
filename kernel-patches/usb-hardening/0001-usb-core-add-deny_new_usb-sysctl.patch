@@ -1,36 +1,32 @@
 usb: core: add kernel.deny_new_usb host-insertion gate
 
-Adds a runtime switch at /proc/sys/kernel/deny_new_usb. While set to 1 the
-hub driver stops enumerating any USB device that newly appears on a port;
-devices already attached keep working. Flipping it needs CAP_SYS_ADMIN.
-It defaults to 0, so a kernel without a userspace controller behaves
-exactly like stock. Meant to be driven by the "USB Manager" root module to
-close the ~1s userspace gap on gadget-HAL rebind.
+Runtime switch at /proc/sys/kernel/deny_new_usb. While set to 1 the hub
+driver stops enumerating USB devices that newly appear on a port; devices
+already attached keep working. Flipping it needs CAP_SYS_ADMIN and it
+defaults to 0, so a kernel without a userspace controller behaves like
+stock. Driven by the DaddyUSB root module.
 
-Implementation is a single file-scope int plus a register_sysctl() call, so
-no exported symbol, signature or module-visible struct changes - the GKI
-KMI is untouched and stock vendor modules still load.
+A file-scope int plus a register_sysctl() at hub init - no exported symbol,
+signature or module-visible struct change, so the GKI KMI is untouched and
+stock vendor modules still load. usbcore is built into vmlinux, so the knob
+registers once at boot and is never torn down. Applies across
+android14-6.1 / android15-6.6 / android16-6.12.
 
 Inspired by GrapheneOS' deny_new_usb (GPL-2.0).
 
 Signed-off-by: @Dev_DcS
 ---
 diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
-index a81c392..b1853c9 100644
+index 090b3a7..dad8544 100644
 --- a/drivers/usb/core/hub.c
 +++ b/drivers/usb/core/hub.c
-@@ -34,12 +34,49 @@
- 
- #include <linux/bitfield.h>
- #include <linux/uaccess.h>
-+#include <linux/capability.h>
-+#include <linux/sysctl.h>
- #include <asm/byteorder.h>
- #include <trace/hooks/usb.h>
- 
- #include "hub.h"
+@@ -40,6 +40,42 @@
+ #include "phy.h"
  #include "otg_productlist.h"
  
++#include <linux/capability.h>
++#include <linux/sysctl.h>
++
 +/*
 + * USB host-side insertion gate. When deny_new_usb is set to 1 the hub
 + * driver stops enumerating any device that shows up on a port from that
@@ -64,12 +60,10 @@ index a81c392..b1853c9 100644
 +	{ }
 +};
 +
-+static struct ctl_table_header *usb_core_sysctl_hdr;
-+
  #define USB_VENDOR_GENESYS_LOGIC		0x05e3
  #define USB_VENDOR_SMSC				0x0424
  #define USB_PRODUCT_USB5534B			0x5534
-@@ -5416,6 +5453,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
+@@ -5445,6 +5481,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
  			goto done;
  		return;
  	}
@@ -83,25 +77,15 @@ index a81c392..b1853c9 100644
  	if (hub_is_superspeed(hub->hdev))
  		unit_load = 150;
  	else
-@@ -6047,8 +6091,10 @@ int usb_hub_init(void)
+@@ -6076,8 +6119,10 @@ int usb_hub_init(void)
  	 * over to the companion full-speed controller.
  	 */
  	hub_wq = alloc_workqueue("usb_hub_wq", WQ_FREEZABLE, 0);
 -	if (hub_wq)
 +	if (hub_wq) {
-+		usb_core_sysctl_hdr = register_sysctl("kernel", usb_core_sysctls);
++		register_sysctl("kernel", usb_core_sysctls);
  		return 0;
 +	}
  
  	/* Fall through if kernel_thread failed */
  	usb_deregister(&hub_driver);
-@@ -6059,6 +6105,9 @@ int usb_hub_init(void)
- 
- void usb_hub_cleanup(void)
- {
-+	if (usb_core_sysctl_hdr)
-+		unregister_sysctl_table(usb_core_sysctl_hdr);
-+
- 	destroy_workqueue(hub_wq);
- 
- 	/*

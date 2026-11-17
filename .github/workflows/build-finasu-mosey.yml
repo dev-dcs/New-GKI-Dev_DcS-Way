@@ -560,8 +560,8 @@ jobs:
               for p in "$USBD"/0001-usb-core-add-deny_new_usb-sysctl.patch \
                        "$USBD"/0002-usb-gadget-add-deny_usb_gadget-sysctl.patch; do
                 [ -f "$p" ] || { echo "::error::USB hardening: missing $(basename "$p")"; exit 1; }
-                if patch -p1 -N -s --dry-run -i "$p" >/dev/null 2>&1; then
-                  patch -p1 -N -s --no-backup-if-mismatch -i "$p"
+                if patch -p1 -N -s --fuzz=3 --dry-run -i "$p" >/dev/null 2>&1; then
+                  patch -p1 -N -s --fuzz=3 --no-backup-if-mismatch -i "$p"
                   echo "[+] applied $(basename "$p")"
                 else
                   echo "::error::USB hardening patch did not apply cleanly: $(basename "$p")"
@@ -571,6 +571,51 @@ jobs:
               echo "[+] USB hardening switches in place"
             else
               echo "::error::USB hardening requested but kernel-patches/usb-hardening not found"
+              exit 1
+            fi
+          fi
+
+          # 2b-hard. Extra kernel hardening - always on, defaults safe. Codegen /
+          # instrumentation only, so no KMI symbol-list or struct change: zero
+          # call-used regs on return, fatal list corruption (6.6+), and dmesg
+          # locked to CAP_SYSLOG from boot. The runtime sysctl bundle that pairs
+          # with these lives in kernel-patches/hardening/ and is applied by a root
+          # module (DaddyUSB), not baked here. olddefconfig drops any symbol a
+          # given tree lacks, so this never fails the build.
+          if true; then
+            echo "[+] Applying @Dev_DcS kernel hardening config..."
+            DEF="arch/arm64/configs/gki_defconfig"
+            grep -q '^CONFIG_ZERO_CALL_USED_REGS=y'   "$DEF" || echo 'CONFIG_ZERO_CALL_USED_REGS=y'   >> "$DEF"
+            grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' "$DEF" || echo 'CONFIG_SECURITY_DMESG_RESTRICT=y' >> "$DEF"
+            case "${{ matrix.kernel_version }}" in
+              android15-6.6|android16-6.12)
+                grep -q '^CONFIG_LIST_HARDENED=y' "$DEF" || echo 'CONFIG_LIST_HARDENED=y' >> "$DEF"
+                ;;
+              *)
+                echo "[i] LIST_HARDENED skipped on ${{ matrix.kernel_version }} (6.6+ only)"
+                ;;
+            esac
+            echo "[+] hardening config appended"
+          fi
+
+          # 2b-ptrace. TracerPid leak fix - always on, default 0. Adds
+          # kernel.hide_tracerpid: when set, /proc/<pid>/status TracerPid reads 0
+          # so anti-debug / anti-Frida checks can't spot a ptrace injection
+          # (Zygisk, Frida, gdb). KMI-safe (file-scope static + register_sysctl,
+          # task_state stays static). Fail loud, like the USB gates.
+          if true; then
+            echo "[+] Applying TracerPid leak fix (hide_tracerpid)..."
+            TPP="$GITHUB_WORKSPACE/kernel-patches/hardening/0001-proc-hide-tracerpid.patch"
+            if [ -f "$TPP" ]; then
+              if patch -p1 -N -s --fuzz=3 --dry-run -i "$TPP" >/dev/null 2>&1; then
+                patch -p1 -N -s --fuzz=3 --no-backup-if-mismatch -i "$TPP"
+                echo "[+] TracerPid fix applied"
+              else
+                echo "::error::TracerPid patch did not apply cleanly"
+                exit 1
+              fi
+            else
+              echo "::error::TracerPid fix requested but patch not found"
               exit 1
             fi
           fi

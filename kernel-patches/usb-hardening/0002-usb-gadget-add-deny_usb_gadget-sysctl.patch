@@ -1,28 +1,29 @@
 usb: gadget: add kernel.deny_usb_gadget peripheral kill switch
 
-Adds a runtime switch at /proc/sys/kernel/deny_usb_gadget. While set to 1
-the UDC core refuses to pull up the data lines, so the device cannot
-present any gadget function to a host; VBUS (charging) is left alone.
-Writing 1 bounces every registered UDC through its existing vbus work so
-they disconnect immediately; writing 0 lets VBUS drive them back up via
-the core's own connect-control path. soft_connect, UDC bind and function
-activation cannot reconnect while the switch is set. Flipping it needs
-CAP_SYS_ADMIN; it defaults to 0.
+Runtime switch at /proc/sys/kernel/deny_usb_gadget. While set to 1 the UDC
+core refuses to pull up the data lines, so the device can't present any
+gadget function to a host; VBUS (charging) is left alone. Writing 1 bounces
+every registered UDC through its existing vbus work so they disconnect at
+once; writing 0 lets VBUS drive them back up via the core's own
+connect-control path. soft_connect, UDC bind and function activation can't
+reconnect while set. CAP_SYS_ADMIN to flip; defaults to 0.
 
-The write handler deliberately does NOT call the connect/disconnect helpers
-directly: those take connect_lock and (on disconnect) udc_lock, so invoking
-them while walking udc_list under udc_lock would invert the
-connect_lock -> udc_lock order and recurse on udc_lock. Scheduling each
-UDC's vbus work keeps the locking order intact.
+The write handler does NOT call the connect/disconnect helpers directly:
+they take connect_lock and (on disconnect) udc_lock, so doing that while
+walking udc_list under udc_lock would invert the connect_lock -> udc_lock
+order and recurse on udc_lock. Scheduling each UDC's vbus work keeps the
+order intact.
 
-Only file-scope statics and a register_sysctl() call are added; the two
-touched helpers are static. No exported symbol, signature or
-module-visible struct changes - the GKI KMI is untouched.
+File-scope statics plus a register_sysctl() in a late_initcall; the two
+touched helpers stay static and usb_udc_init is left untouched, so the knob
+lands the same way on 6.1's class_create tree as on 6.6/6.12. No exported
+symbol, signature or module-visible struct change - the GKI KMI is
+untouched. Applies across android14-6.1 / android15-6.6 / android16-6.12.
 
 Signed-off-by: @Dev_DcS
 ---
 diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
-index bac6dd8..0a8f933 100644
+index e28fea6..c97f347 100644
 --- a/drivers/usb/gadget/udc/core.c
 +++ b/drivers/usb/gadget/udc/core.c
 @@ -17,6 +17,8 @@
@@ -62,16 +63,16 @@ index bac6dd8..0a8f933 100644
  	if (!gadget->ops->pullup) {
  		ret = -EOPNOTSUPP;
  		goto out;
-@@ -1129,7 +1145,7 @@ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
+@@ -1134,7 +1150,7 @@ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
  /* Acquire connect_lock before calling this function. */
- static void usb_udc_connect_control_locked(struct usb_udc *udc) __must_hold(&udc->connect_lock)
+ static int usb_udc_connect_control_locked(struct usb_udc *udc) __must_hold(&udc->connect_lock)
  {
 -	if (udc->vbus)
 +	if (udc->vbus && !deny_usb_gadget)
- 		usb_gadget_connect_locked(udc->gadget);
+ 		return usb_gadget_connect_locked(udc->gadget);
  	else
- 		usb_gadget_disconnect_locked(udc->gadget);
-@@ -1888,6 +1904,52 @@ static const struct bus_type gadget_bus_type = {
+ 		return usb_gadget_disconnect_locked(udc->gadget);
+@@ -1904,6 +1920,57 @@ static const struct bus_type gadget_bus_type = {
  	.match = gadget_match_driver,
  };
  
@@ -119,32 +120,13 @@ index bac6dd8..0a8f933 100644
 +	{ }
 +};
 +
-+static struct ctl_table_header *usb_gadget_sysctl_hdr;
++static int __init usb_gadget_sysctl_init(void)
++{
++	register_sysctl("kernel", usb_gadget_sysctls);
++	return 0;
++}
++late_initcall(usb_gadget_sysctl_init);
 +
  static int __init usb_udc_init(void)
  {
  	int rc;
-@@ -1897,14 +1959,21 @@ static int __init usb_udc_init(void)
- 		return rc;
- 
- 	rc = bus_register(&gadget_bus_type);
--	if (rc)
-+	if (rc) {
- 		class_unregister(&udc_class);
--	return rc;
-+		return rc;
-+	}
-+
-+	usb_gadget_sysctl_hdr = register_sysctl("kernel", usb_gadget_sysctls);
-+
-+	return 0;
- }
- subsys_initcall(usb_udc_init);
- 
- static void __exit usb_udc_exit(void)
- {
-+	if (usb_gadget_sysctl_hdr)
-+		unregister_sysctl_table(usb_gadget_sysctl_hdr);
- 	bus_unregister(&gadget_bus_type);
- 	class_unregister(&udc_class);
- }
