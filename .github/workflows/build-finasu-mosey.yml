@@ -18,9 +18,13 @@ on:
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "LTS sublevel: 'LTS' (tip of Google's LTS branch for the family) or the last digits of an older one, e.g. 150"
+        description: "Sublevel: 'LTS' (tip of the branch picked for the family) or the last digits of an older one, e.g. 150"
         type: string
         default: "LTS"
+      kmi_generation:
+        description: "KMI generation of the phone's stock kernel = the number after 'androidNN-' in `uname -r` (6.12.81-android16-6-g... is 6). 'auto' = the one Google's newest release branch is on. A kernel of another generation bootloops."
+        type: string
+        default: "auto"
       kernel_name:
         description: "Custom kernel name for uname (e.g. Dev_DcS). Letters/digits/._- only. Blank = stock."
         type: string
@@ -159,42 +163,148 @@ jobs:
           import os
           import re
           import sys
+          import time
+          import urllib.error
           import urllib.request
 
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
+          req_kmi = "${{ inputs.kmi_generation }}".strip().lower() or "auto"
 
           all_families = [
-              {"kernel_version": "android14-6.1",  "kver": "6.1",  "manifest_branch": "common-android14-6.1-lts",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
-              {"kernel_version": "android15-6.6",  "kver": "6.6",  "manifest_branch": "common-android15-6.6-lts",  "susfs_branch": "gki-android15-6.6",  "cache_type": "bazel", "build_tool": "bazel"},
-              {"kernel_version": "android16-6.12", "kver": "6.12", "manifest_branch": "common-android16-6.12-lts", "susfs_branch": "gki-android16-6.12", "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android14-6.1",  "kver": "6.1",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android15-6.6",  "kver": "6.6",  "susfs_branch": "gki-android15-6.6",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android16-6.12", "kver": "6.12", "susfs_branch": "gki-android16-6.12", "cache_type": "bazel", "build_tool": "bazel"},
           ]
 
           selected = all_families if req_family == "all" else [f for f in all_families if f["kernel_version"] == req_family]
 
-          # 'LTS' means the tip of the branch the manifest syncs, so there is no
-          # table of sublevels to keep bumping (the old one said 6.1.192 while
-          # Google's 6.1 branch was still on .182, and the build got relabelled
-          # to match). The number shown in the job name is read from Google's
-          # tree right now; the sync step reports whatever it really checked out.
-          def gitiles(repo, ref, path):
-              url = f"https://android.googlesource.com/{repo}/+/refs/heads/{ref}/{path}?format=TEXT"
-              with urllib.request.urlopen(url, timeout=30) as r:
-                  return base64.b64decode(r.read()).decode("utf-8", "replace")
+          if req_kmi != "auto" and not req_kmi.isdigit():
+              print(f"::error::kmi_generation is '{req_kmi}': use 'auto' or the number from `uname -r` (…-android16-6-… is 6)")
+              sys.exit(1)
 
-          def branch_tip(fam):
+          GOOGLE = "https://android.googlesource.com"
+
+          def fetch(url):
+              for attempt in (1, 2, 3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as r:
+                          return r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404 or attempt == 3:   # not there is an answer, not a hiccup
+                          raise
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                  time.sleep(2 * attempt)
+
+          def gitiles(repo, ref, path):
+              return base64.b64decode(fetch(f"{GOOGLE}/{repo}/+/refs/heads/{ref}/{path}?format=TEXT")).decode("utf-8", "replace")
+
+          def manifest_branches():
+              return list(json.loads(fetch(f"{GOOGLE}/kernel/manifest/+refs/heads?format=JSON").decode().split("\n", 1)[1]))
+
+          _seen = {}
+          def branch_info(manifest_branch):
+              """Version and KMI generation at the tip of what a manifest syncs, or None."""
+              if manifest_branch not in _seen:
+                  try:
+                      manifest = gitiles("kernel/manifest", manifest_branch, "default.xml")
+                      proj = re.search(r'<project[^>]*path="common"[^>]*>', manifest)
+                      rev = re.search(r'revision="([^"]+)"', proj.group(0)) if proj else None
+                      rev = (rev or re.search(r'<default[^>]*revision="([^"]+)"', manifest)).group(1)
+                      makefile = gitiles("kernel/common", rev, "Makefile")
+                      version = ".".join(re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
+                                         for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL"))
+                      kmi = None
+                      for f in ("build.config.constants", "build.config.common"):   # 6.12 / 6.6 and older
+                          try:
+                              m = re.search(r"^KMI_GENERATION=(\d+)", gitiles("kernel/common", rev, f), re.M)
+                          except Exception:
+                              m = None
+                          if m:
+                              kmi = int(m.group(1))
+                              break
+                      _seen[manifest_branch] = {"manifest": manifest_branch, "branch": rev, "version": version, "kmi": kmi}
+                  except Exception:   # old release manifests pin a tag, not a branch
+                      _seen[manifest_branch] = None
+              return _seen[manifest_branch]
+
+          def pick_branch(fam, kmi, asked):
+              """Which of Google's branches to build for this family.
+
+              kmi is 'auto' or a generation number, asked is a full x.y.z or None.
+
+              The phone's drivers are built for one KMI generation and only load on a
+              kernel of that same generation. The -lts branch moves on to the next one
+              before any phone does: 6.12 -lts went to 7 while every release Google has
+              cut, and with it the Pixel 10, is on 6 - and a generation-7 kernel on
+              that phone is a bootloop. So "newest code" and "boots" are not always the
+              same branch: take -lts while it is on the wanted generation, otherwise
+              the newest dated release branch that is.
+              """
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
               try:
-                  manifest = gitiles("kernel/manifest", fam["manifest_branch"], "default.xml")
-                  proj = re.search(r'<project[^>]*path="common"[^>]*>', manifest)
-                  rev = re.search(r'revision="([^"]+)"', proj.group(0)) if proj else None
-                  rev = rev or re.search(r'<default[^>]*revision="([^"]+)"', manifest)
-                  makefile = gitiles("kernel/common", rev.group(1), "Makefile")
-                  parts = [re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
-                           for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL")]
-                  return ".".join(parts)
-              except Exception as e:  # network hiccup: not worth failing the run for a label
-                  print(f"::warning::could not read the tip of {fam['manifest_branch']} ({e}); the job name shows a placeholder")
-                  return None
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+
+              def releases(gen):
+                  # dated branches on that generation, newest first; generations only go
+                  # up, and the oldest manifests pin tags instead of branches
+                  seen_one = False
+                  for b in dated:
+                      i = branch_info(b)
+                      if not i or not i["kmi"]:
+                          if seen_one:
+                              return
+                          continue
+                      seen_one = True
+                      if i["kmi"] < gen:
+                          return
+                      if i["kmi"] == gen:
+                          yield i
+
+              if kmi.isdigit():
+                  want = int(kmi)
+              else:   # auto: whatever the newest release is on, since that is what phones get
+                  want = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if want is None and lts:
+                      want = lts["kmi"]
+              if want is None:
+                  # used to be worth only a placeholder in the job name; now it decides
+                  # whether the result boots, so no guessing
+                  print(f"::error::{name}: could not read Google's branches to work out the KMI generation. "
+                        f"Nothing built - run it again.")
+                  sys.exit(1)
+
+              # Google's CI publishes builds of the dated branches but not of -lts, so
+              # a -lts build is cross-checked against the newest release it should
+              # still be compatible with, a release build against its own branch.
+              if lts and lts["kmi"] == want:
+                  ref = next(releases(want), None)
+                  return dict(lts, ref=ref["branch"] if ref else "", ref_exact="false")
+
+              src = None
+              if asked:   # a release branch sitting on exactly that sublevel beats digging it out of history
+                  src = next((i for i in releases(want) if i["version"] == asked), None)
+              src = src or next(releases(want), None)
+              if src:
+                  print(f"[i] {name}: -lts is on KMI generation {lts['kmi'] if lts else '?'}, "
+                        f"building {src['branch']} ({src['version']}) which is on {want}")
+                  return dict(src, ref=src["branch"], ref_exact="true")
+
+              have = sorted({i["kmi"] for i in map(branch_info, dated[:6]) if i and i["kmi"]} | ({lts["kmi"]} if lts else set()))
+              msg = f"{name}: no branch on KMI generation {want} (Google has {', '.join(map(str, have)) or 'none readable'})."
+              if len(selected) == 1 or not kmi.isdigit():
+                  print(f"::error::{msg}")
+                  sys.exit(1)
+              # one number typed for several families only fits one of them
+              print(f"::warning::{msg} Using 'auto' for this family.")
+              return None
 
           def requested(fam):
               # bare digits -> that sublevel; a full x.y.z of this family -> as given;
@@ -212,13 +322,22 @@ jobs:
           for fam in selected:
               entry = dict(fam)
               want = requested(fam)
-              tip = branch_tip(fam)
-              # asking for a sublevel Google has not merged yet used to "work"
-              # by renaming the tip. Say no here, before an hour of sync and
-              # build - or, when several families share one number, let the
+              src = pick_branch(fam, req_kmi, want) or pick_branch(fam, "auto", want)
+              entry["manifest_branch"] = src["manifest"]
+              entry["gki_branch"] = src["branch"]
+              entry["kmi_generation"] = str(src["kmi"] or "")
+              entry["kmi_ref_branch"] = src["ref"]
+              entry["kmi_ref_exact"] = src["ref_exact"]
+              tip = src["version"]
+              if want == tip:
+                  want = None                            # that is the tip, nothing to dig for
+              # The number in the job name is read from Google's tree right now (no
+              # table of sublevels to go stale). Asking for one that isn't there yet
+              # used to "work" by renaming the tip: say no here, before an hour of
+              # sync and build - or, when several families share one number, let the
               # ones that don't have it build their tip under its own name.
               if want and tip and int(want.rsplit(".", 1)[1]) > int(tip.rsplit(".", 1)[1]):
-                  msg = f"{want} does not exist yet: {fam['manifest_branch']} is at {tip}."
+                  msg = f"{want} does not exist on {src['branch']}, which is at {tip}."
                   if len(selected) == 1:
                       print(f"::error::{msg} Use 'LTS' or a sublevel up to {tip.rsplit('.', 1)[1]}.")
                       sys.exit(1)
@@ -315,7 +434,7 @@ jobs:
   # JOB 3: Standalone builder (6.1 / 6.6 / 6.12 + Mosey)
   # ============================================================================
   build-all-versions-mosey:
-    name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | ${{ matrix.root_variant }} + Mosey)"
+    name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | KMI ${{ matrix.kmi_generation }} | ${{ matrix.root_variant }} + Mosey)"
     needs: generate-matrix
     if: ${{ inputs.build_variant == 'standalone-matrix' }}
     runs-on: ubuntu-latest
@@ -453,9 +572,25 @@ jobs:
             # only possible on 'LTS' when the branch moved between the two jobs
             echo "::notice::job name says $REQ_LTS, the tree that was synced is $RESOLVED_KVER - the artifacts carry the real one"
           fi
+
+          # Last word on the KMI generation comes from the tree on disk, after
+          # any sublevel checkout. The phone's vendor modules only load on the
+          # generation they were built for; a kernel on another one compiles,
+          # flashes and then loops at boot, so stop here instead.
+          KMI_GEN="$(sed -n 's/^KMI_GENERATION=//p' build.config.constants build.config.common 2>/dev/null | head -n1)"
+          WANT_KMI="${{ matrix.kmi_generation }}"
+          if [ -n "$WANT_KMI" ] && [ "$KMI_GEN" != "$WANT_KMI" ]; then
+            echo "::error::${RESOLVED_KVER} on ${{ matrix.gki_branch }} is KMI generation ${KMI_GEN:-unknown}, this run is for generation ${WANT_KMI}. An older sublevel can sit on an older generation: pick one from this generation or set kmi_generation to match the phone."
+            exit 1
+          fi
+          BRANCH_TAG="$(sed -n 's/^BRANCH=//p' build.config.constants build.config.common 2>/dev/null | head -n1)"
+          KMI_TAG="${BRANCH_TAG%-*}-${KMI_GEN}"    # android16-6.12 + 6 -> android16-6
+
           echo "resolved_kver=${RESOLVED_KVER}" >> "$GITHUB_OUTPUT"
           echo "resolved_sublevel=${CURRENT_SUBLEVEL}" >> "$GITHUB_OUTPUT"
-          echo "[*] Building kernel version: ${RESOLVED_KVER} (${{ matrix.kernel_version }})"
+          echo "kmi_generation=${KMI_GEN}" >> "$GITHUB_OUTPUT"
+          echo "kmi_tag=${KMI_TAG}" >> "$GITHUB_OUTPUT"
+          echo "[*] Building kernel version: ${RESOLVED_KVER} (${{ matrix.gki_branch }}, KMI ${KMI_TAG})"
 
       - name: Fetch WildKernels Patches, SUSFS (${{ matrix.susfs_branch }}), and Mosey Extended
         shell: bash
@@ -1595,6 +1730,91 @@ jobs:
             fi
           fi
 
+      - name: KMI check against Google's own build (@Dev_DcS)
+        shell: bash
+        working-directory: ${{ github.workspace }}/kernel_workspace
+        run: |
+          set -uo pipefail
+          # The phone's vendor modules carry a CRC for every kernel symbol they
+          # import and refuse to load if the kernel's differs. Same compiler,
+          # same branch: every CRC Google's build exports has to come out
+          # identical here, and a patch or config switch that bends a struct
+          # shows up as a difference right now rather than as a bootloop.
+          TARGET="${KTARGET:-kernel_aarch64}"
+          REF="${{ matrix.kmi_ref_branch }}"
+          MINE="$(find out/dist "bazel-bin/common/$TARGET" -maxdepth 2 -name vmlinux.symvers 2>/dev/null | head -n1 || true)"
+          if [ -z "$MINE" ]; then
+            echo "::warning::no vmlinux.symvers in the build output - KMI not cross-checked"
+            exit 0
+          fi
+          if [ -z "$REF" ]; then
+            echo "::warning::Google publishes no build to compare ${{ matrix.gki_branch }} with - KMI not cross-checked"
+            exit 0
+          fi
+
+          CI="https://ci.android.com/builds"
+          BID="$(curl -fsSL --retry 3 --max-time 60 "$CI/branches/aosp_kernel-common-${REF}/status.json" \
+                   | python3 -c 'import json, sys; print(next(t["last_known_good_build"] for t in json.load(sys.stdin)["targets"] if t["name"] == sys.argv[1]))' "$TARGET" 2>/dev/null || true)"
+          THEIRS="$RUNNER_TEMP/google.symvers"
+          if [ -z "$BID" ] || ! curl -fsSL --retry 3 --max-time 300 -o "$THEIRS" "$CI/submitted/$BID/$TARGET/latest/raw/vmlinux.symvers"; then
+            echo "::warning::could not fetch Google's vmlinux.symvers for $REF - KMI not cross-checked"
+            exit 0
+          fi
+
+          LIST="common/gki/aarch64/symbols/pixel"
+          [ -f "$LIST" ] || LIST="common/android/abi_gki_aarch64_pixel"
+          rc=0
+          python3 - "$MINE" "$THEIRS" "$LIST" "$REF" "$BID" <<'PY' || rc=$?
+          import sys
+
+          def crcs(path):
+              out = {}
+              with open(path) as f:
+                  for line in f:
+                      col = line.rstrip("\n").split("\t")
+                      if len(col) >= 2 and col[0].startswith("0x"):
+                          out[col[1]] = col[0]
+              return out
+
+          mine, theirs = crcs(sys.argv[1]), crcs(sys.argv[2])
+          ref, bid = sys.argv[4], sys.argv[5]
+          if len(mine) < 1000 or len(theirs) < 1000:
+              print(f"::warning::symbol lists look wrong (ours {len(mine)}, Google's {len(theirs)}) - KMI not cross-checked")
+              sys.exit(0)
+          try:
+              with open(sys.argv[3]) as f:
+                  pixel = {l.strip() for l in f if l.strip() and not l.lstrip().startswith(("[", "#"))}
+          except OSError:
+              pixel = set()
+
+          changed = sorted(s for s in theirs if s in mine and mine[s] != theirs[s])
+          missing = sorted(s for s in theirs if s not in mine)
+          # no Pixel list in this tree: then every symbol Google exports counts
+          hits = [s for s in changed + missing if not pixel or s in pixel]
+
+          print(f"[i] compared with Google's {ref} build {bid}: {len(theirs)} exported symbols, "
+                f"{len(changed)} with a different CRC, {len(missing)} not exported here")
+          for s in (changed + missing)[:40]:
+              print(f"      {'CRC ' if s in mine else 'gone'}  {s}{'   <- Pixel list' if s in pixel else ''}")
+          if hits:
+              print(f"KMI_HITS={len(hits)} e.g. {', '.join(hits[:6])}")
+              sys.exit(3)
+          scope = f"all {len(pixel & theirs.keys())} Pixel-list symbols" if pixel else "every exported symbol"
+          print(f"[+] KMI intact: {scope} match Google's build")
+          PY
+          if [ "$rc" -eq 3 ]; then
+            MSG="symbols the Pixel drivers import do not match Google's $REF build (list above); modules using them will not load"
+            if [ "${{ matrix.kmi_ref_exact }}" = "true" ] && [ "${{ inputs.allow_version_mismatch }}" != "true" ]; then
+              echo "::error::KMI broken: $MSG. Something in this build changed the ABI - not packaging a kernel that would loop at boot."
+              exit 1
+            fi
+            # -lts runs ahead of the release it is compared with, so there this
+            # is a heads-up and the flash guard and the phone have the last word
+            echo "::warning::KMI differs: $MSG."
+          elif [ "$rc" -ne 0 ]; then
+            echo "::warning::KMI comparison did not run to the end (rc=$rc)"
+          fi
+
       - name: Build & Package Mosey wonder KSU Module (out-of-tree `.ko`)
         id: mosey
         if: ${{ inputs.mosey_mode != 'disabled' }}
@@ -1816,6 +2036,56 @@ jobs:
             exit 1
           fi
 
+          # Flash-time guard. A GKI Image only runs with vendor modules built for
+          # the same KMI generation and page size; get either wrong and the phone
+          # just loops at boot (a generation-7 build on a generation-6 Pixel 10
+          # did exactly that). The zip now compares itself with the kernel that
+          # is running and refuses before it writes anything.
+          KMI_TAG="${{ steps.sync-kernel.outputs.kmi_tag }}"
+          cat > AnyKernel3/tools/kmi-guard.sh <<'GUARD_EOF'
+          # KMI / page-size guard, sourced by anykernel.sh right after ak3-core.sh.
+          #
+          # The kernel running right now is the one this phone's vendor modules
+          # match. If this Image is another KMI generation (the "android16-6" in
+          # uname -r) or another page size, those modules will not load and the
+          # phone loops at boot - so say so and stop while nothing is written yet.
+          #   -- @Dev_DcS
+          zip_kmi="@KMI@"
+          zip_page="@PAGE@"
+
+          run_rel="$(uname -r)"
+          run_kmi="$(echo "$run_rel" | grep -o 'android[0-9][0-9]*-[0-9][0-9]*' | head -n1)"
+          case "$(awk '/^KernelPageSize:/ { print $2; exit }' /proc/self/smaps 2>/dev/null)" in
+            4)  run_page=4k ;;
+            16) run_page=16k ;;
+            *)  run_page="" ;;
+          esac
+
+          ui_print " " "  -> This zip:    KMI ${zip_kmi:-unknown}, $zip_page pages"
+          ui_print "  -> Running now: KMI ${run_kmi:-unknown}, ${run_page:-unknown} pages"
+
+          if [ -e /data/local/tmp/kmi_guard_off ]; then
+            ui_print "  -> /data/local/tmp/kmi_guard_off is there, not checking"
+          elif [ -n "$zip_kmi" ] && [ -n "$run_kmi" ] && [ "$run_kmi" != "$zip_kmi" ]; then
+            abort "  -> Wrong KMI generation for this phone ($run_rel)." \
+                  "     Its drivers are built for $run_kmi and will not load on $zip_kmi:" \
+                  "     that is a bootloop, so nothing was flashed." \
+                  "     Build ${run_kmi%-*}-$(echo "$run_rel" | cut -d. -f1,2) with kmi_generation=${run_kmi##*-} instead."
+          elif [ -n "$run_page" ] && [ "$run_page" != "$zip_page" ]; then
+            abort "  -> Wrong page size for this phone." \
+                  "     It runs $run_page pages, this kernel is built for $zip_page:" \
+                  "     that is a bootloop, so nothing was flashed." \
+                  "     Build again with page_size=$run_page."
+          fi
+          GUARD_EOF
+          sed -i "s/@KMI@/${KMI_TAG}/; s/@PAGE@/${{ inputs.page_size }}/" AnyKernel3/tools/kmi-guard.sh
+          if grep -q '^\. tools/ak3-core\.sh' AnyKernel3/anykernel.sh; then
+            sed -i '/^\. tools\/ak3-core\.sh/a . $AKHOME/tools/kmi-guard.sh' AnyKernel3/anykernel.sh
+            echo "[+] flash guard in place: KMI ${KMI_TAG:-unknown}, ${{ inputs.page_size }} pages"
+          else
+            echo "::warning::anykernel.sh has a layout this step does not know - the zip has no KMI / page-size guard"
+          fi
+
           KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
           # a 16k zip flashed on a 4k phone (or the other way round) does not
           # boot, so the odd one out says what it is
@@ -1828,6 +2098,7 @@ jobs:
           Kernel Family: ${{ matrix.kernel_version }}
           Resolved Kernel Version: ${KVER_FULL}
           Page Size: ${{ inputs.page_size }}
+          KMI: ${KMI_TAG} (flash only on a phone whose stock uname -r shows the same)
           Manifest Branch: ${{ matrix.manifest_branch }}
           SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
           Root Implementation: FinaSU
