@@ -1044,24 +1044,43 @@ jobs:
           	return 0;
           }
 
-          /* 6.13 started passing the netdev in (android16-6.12 still has the old form) */
-          #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-          static int wonder_set_monitor_channel(struct wiphy *wiphy, struct net_device *dev,
-          				      struct cfg80211_chan_def *chandef)
-          #else
-          static int wonder_set_monitor_channel(struct wiphy *wiphy,
-          				      struct cfg80211_chan_def *chandef)
-          #endif
+          /*
+           * 6.13 started passing the netdev to .set_monitor_channel, and android16-6.12
+           * carries that change too while android15-6.6 and older don't. A version
+           * check gets that wrong (it did: this was keyed on 6.13 and broke on 6.12),
+           * so both forms are here and the compiler takes whichever one the ops
+           * struct of the tree being built against actually declares.
+           */
+          static int wonder_monitor_channel(struct cfg80211_chan_def *chandef)
           {
           	pr_debug("monitor channel %u MHz\n", chandef->chan->center_freq);
           	return 0;
           }
 
+          static int wonder_set_monitor_channel(struct wiphy *wiphy,
+          				      struct cfg80211_chan_def *chandef)
+          {
+          	return wonder_monitor_channel(chandef);
+          }
+
+          static int wonder_set_monitor_channel_dev(struct wiphy *wiphy,
+          					  struct net_device *dev,
+          					  struct cfg80211_chan_def *chandef)
+          {
+          	return wonder_monitor_channel(chandef);
+          }
+
+          #define WONDER_SET_MONITOR_CHANNEL					\
+          	__builtin_choose_expr(						\
+          		__same_type(((struct cfg80211_ops *)0)->set_monitor_channel, \
+          			    &wonder_set_monitor_channel_dev),		\
+          		wonder_set_monitor_channel_dev, wonder_set_monitor_channel)
+
           static const struct cfg80211_ops wonder_cfg_ops = {
           	.add_virtual_intf	= wonder_add_iface,
           	.del_virtual_intf	= wonder_del_iface,
           	.change_virtual_intf	= wonder_change_iface,
-          	.set_monitor_channel	= wonder_set_monitor_channel,
+          	.set_monitor_channel	= WONDER_SET_MONITOR_CHANNEL,
           };
 
           /* ---- vendor commands -------------------------------------------------- */
