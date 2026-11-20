@@ -1884,7 +1884,17 @@ jobs:
           cp "$cfg" "$OBJ/.config"
           # 6.12 GKI has CONFIG_RUST=y; a C module never needs it and the runner
           # has no matching rustc, so switch it off rather than let olddefconfig guess
-          [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
+          # RUST: a C module never needs it and the runner has no matching rustc.
+          # TRIM_UNUSED_KSYMS: on (older) GKI like 6.1 the synced .config carries
+          # it, which makes modules_prepare regenerate autoksyms.h from an ABI
+          # whitelist (abi_symbollist.raw) that isn't in this standalone module
+          # tree -> "whitelist file not found" and the module is skipped. Trimming
+          # unused exports is a whole-kernel step that means nothing for one
+          # out-of-tree .ko (the real kernel was already built by Kleaf), so drop
+          # it here. 6.6/6.12 don't set it; disabling it there is a no-op.
+          if [ -f common/scripts/config ]; then
+            common/scripts/config --file "$OBJ/.config" --disable RUST --disable TRIM_UNUSED_KSYMS || true
+          fi
 
           mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
               LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)")
@@ -2215,7 +2225,17 @@ jobs:
           if [ -z "$clang_bin" ] || [ ! -x "$clang_bin/clang" ]; then echo "::warning::Re-Kernel: no prebuilt clang, skipping"; exit 0; fi
           export PATH="$PWD/$clang_bin:$PATH"
           cp "$cfg" "$OBJ/.config"
-          [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
+          # RUST: a C module never needs it and the runner has no matching rustc.
+          # TRIM_UNUSED_KSYMS: on (older) GKI like 6.1 the synced .config carries
+          # it, which makes modules_prepare regenerate autoksyms.h from an ABI
+          # whitelist (abi_symbollist.raw) that isn't in this standalone module
+          # tree -> "whitelist file not found" and the module is skipped. Trimming
+          # unused exports is a whole-kernel step that means nothing for one
+          # out-of-tree .ko (the real kernel was already built by Kleaf), so drop
+          # it here. 6.6/6.12 don't set it; disabling it there is a no-op.
+          if [ -f common/scripts/config ]; then
+            common/scripts/config --file "$OBJ/.config" --disable RUST --disable TRIM_UNUSED_KSYMS || true
+          fi
           mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)")
           "${mk[@]}" olddefconfig || { echo "::warning::Re-Kernel: olddefconfig failed, skipping"; exit 0; }
           "${mk[@]}" modules_prepare || { echo "::warning::Re-Kernel: modules_prepare failed, skipping"; exit 0; }
