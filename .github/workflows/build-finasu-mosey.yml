@@ -1,4 +1,7 @@
 name: Build FinaSU for Pixel 10 (WildKernels + SUSFS + Mosey + Integrity)
+# what was asked for, readable straight from the runs list - a 6.6 run and a
+# 6.12 run used to look the same there
+run-name: "${{ inputs.kernel_build_version }} | ${{ inputs.gki_lts_version }} | KMI ${{ inputs.kmi_generation }} | ${{ inputs.page_size }} | FinaSU + Mosey"
 
 permissions:
   contents: write
@@ -9,14 +12,14 @@ on:
     inputs:
       # --- Core Kernel & Matrix Selection (All WildKernels Families) ---
       kernel_build_version:
-        description: "Kernel Version Family (select 'all' to build 6.1 / 6.6 / 6.12 in parallel)"
+        description: "Kernel family = the phone's stock kernel (`uname -r` 6.12.x-android16-... is android16-6.12, 6.6.x-android15-... is android15-6.6). 'all' builds 6.1 / 6.6 / 6.12 in parallel"
         type: choice
         options:
+          - android16-6.12
           - android15-6.6
           - android14-6.1
-          - android16-6.12
           - all
-        default: android15-6.6
+        default: android16-6.12
       gki_lts_version:
         description: "Sublevel: 'LTS' (tip of the branch picked for the family) or the last digits of an older one, e.g. 150"
         type: string
@@ -732,8 +735,14 @@ jobs:
             cd common
             find . -name "*.rej" -delete || true
             echo "[+] Applying $(basename "$SUSFS_PATCH")"
-            if ! patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH"; then
-              echo "::error::SUSFS patch did not apply cleanly on ${{ matrix.kernel_version }} $KVER_SHORT.$SUBLEVEL"
+            # patch's own default fuzz (2), not 3: these hunks carry three lines
+            # of context, so fuzz 3 means "ignore all of it and go by line
+            # number". On 6.12.81 that dropped two show_smaps_rollup hunks into
+            # the middle of unrelated code and still said "succeeded". The patch
+            # is written for the newer release branch (6.12.92 takes it with no
+            # fuzz at all); a tree it doesn't fit has to fail here.
+            if ! patch -p1 --forward < "$SUSFS_PATCH"; then
+              echo "::error::SUSFS patch does not fit ${{ matrix.gki_branch }} ($KVER_SHORT.$SUBLEVEL): it is written for a different sublevel of this family. Build the branch 'LTS' picks instead of this sublevel."
               find . -name "*.rej" | sed 's/^/  reject: /'
               exit 1
             fi
@@ -1587,6 +1596,16 @@ jobs:
             set_kconfig CONFIG_WIREGUARD y
             set_kconfig CONFIG_TCP_CONG_ADVANCED y
             set_kconfig CONFIG_TCP_CONG_BBR y
+            # Turning ADVANCED on exposes the optional congestion-control algos.
+            # On a tree whose stock defconfig didn't already pin them (6.1: it
+            # has no TCP_CONG lines at all) they default to =m, and those .ko
+            # are not in Google's module_outs, so Kleaf's module check kills the
+            # build. Google's own 6.6/6.12 defconfig ships ADVANCED=y with these
+            # three set "not set" for exactly this reason - mirror it so no
+            # undeclared tcp_cong_*.ko is produced. BBR stays, CUBIC is default.
+            set_kconfig CONFIG_TCP_CONG_BIC n
+            set_kconfig CONFIG_TCP_CONG_WESTWOOD n
+            set_kconfig CONFIG_TCP_CONG_HTCP n
             set_kconfig CONFIG_NET_SCH_FQ y
             set_kconfig CONFIG_NET_SCH_CAKE y
             set_kconfig CONFIG_IP_SET y
