@@ -1,6 +1,4 @@
 name: Build FinaSU for Pixel 10 (WildKernels + SUSFS + Mosey + Integrity)
-# what was asked for, readable straight from the runs list - a 6.6 run and a
-# 6.12 run used to look the same there
 run-name: "${{ inputs.kernel_build_version }} | ${{ inputs.gki_lts_version }} | KMI ${{ inputs.kmi_generation }} | ${{ inputs.page_size }} | FinaSU + Mosey"
 
 permissions:
@@ -10,7 +8,6 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      # --- Core Kernel & Matrix Selection (All WildKernels Families) ---
       kernel_build_version:
         description: "Kernel family = the phone's stock kernel (`uname -r` 6.12.x-android16-... is android16-6.12, 6.6.x-android15-... is android15-6.6). 'all' builds 6.1 / 6.6 / 6.12 in parallel"
         type: choice
@@ -76,7 +73,6 @@ on:
         type: boolean
         default: false
 
-      # --- Regular WildKernels Feature Set Toggles ---
       enable_susfs:
         description: "Enable SUSFS (FinaSU integrates it natively; leave ON for integrity hiding)"
         type: boolean
@@ -126,7 +122,6 @@ on:
         type: boolean
         default: true
 
-      # --- Mosey Extended (AirDrop / Quick Share) Options ---
       mosey_mode:
         description: "Mosey Extended (wonder_mosey_wild) Driver Integration Mode"
         type: choice
@@ -145,7 +140,6 @@ on:
         type: boolean
         default: true
 
-      # --- Integrity / extra kernel features (@Dev_DcS) ---
       integrity_bundle:
         description: "Also fetch the newest integrity tools (Duck-ToolBox, OMK, PlayIntegrityFork, TEESimulator-RS, HMA-OSS) + Keybox Autopilot and attach Integrity_Tools.zip. See integrity/INSTALL_ORDER.md for the Strong/Certified/locked-bootloader combo."
         type: boolean
@@ -163,9 +157,6 @@ on:
         default: false
 
 jobs:
-  # ============================================================================
-  # JOB 1: Resolve build matrix (6.1 / 6.6 / 6.12, FinaSU)
-  # ============================================================================
   generate-matrix:
     name: "Resolve Kernel & Root Matrix"
     runs-on: ubuntu-latest
@@ -194,7 +185,6 @@ jobs:
           req_lts = "${{ inputs.gki_lts_version }}".strip()
           req_kmi = "${{ inputs.kmi_generation }}".strip().lower() or "auto"
           req_root = "${{ inputs.root_variant }}"
-          # 'All' = every manager, but not NoRoot (you ask for that one on its own)
           if req_root == "All":
               roots = ["FinaSU", "KernelSU-Next", "KernelSU", "SukiSU-Ultra", "BakaSU", "KowSU"]
           else:
@@ -220,7 +210,7 @@ jobs:
                       with urllib.request.urlopen(url, timeout=30) as r:
                           return r.read()
                   except urllib.error.HTTPError as e:
-                      if e.code == 404 or attempt == 3:   # not there is an answer, not a hiccup
+                      if e.code == 404 or attempt == 3:
                           raise
                   except Exception:
                       if attempt == 3:
@@ -246,7 +236,7 @@ jobs:
                       version = ".".join(re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
                                          for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL"))
                       kmi = None
-                      for f in ("build.config.constants", "build.config.common"):   # 6.12 / 6.6 and older
+                      for f in ("build.config.constants", "build.config.common"):
                           try:
                               m = re.search(r"^KMI_GENERATION=(\d+)", gitiles("kernel/common", rev, f), re.M)
                           except Exception:
@@ -255,7 +245,7 @@ jobs:
                               kmi = int(m.group(1))
                               break
                       _seen[manifest_branch] = {"manifest": manifest_branch, "branch": rev, "version": version, "kmi": kmi}
-                  except Exception:   # old release manifests pin a tag, not a branch
+                  except Exception:
                       _seen[manifest_branch] = None
               return _seen[manifest_branch]
 
@@ -282,8 +272,6 @@ jobs:
                   dated = []
 
               def releases(gen):
-                  # dated branches on that generation, newest first; generations only go
-                  # up, and the oldest manifests pin tags instead of branches
                   seen_one = False
                   for b in dated:
                       i = branch_info(b)
@@ -299,26 +287,21 @@ jobs:
 
               if kmi.isdigit():
                   want = int(kmi)
-              else:   # auto: whatever the newest release is on, since that is what phones get
+              else:
                   want = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
                   if want is None and lts:
                       want = lts["kmi"]
               if want is None:
-                  # used to be worth only a placeholder in the job name; now it decides
-                  # whether the result boots, so no guessing
                   print(f"::error::{name}: could not read Google's branches to work out the KMI generation. "
                         f"Nothing built - run it again.")
                   sys.exit(1)
 
-              # Google's CI publishes builds of the dated branches but not of -lts, so
-              # a -lts build is cross-checked against the newest release it should
-              # still be compatible with, a release build against its own branch.
               if lts and lts["kmi"] == want:
                   ref = next(releases(want), None)
                   return dict(lts, ref=ref["branch"] if ref else "", ref_exact="false")
 
               src = None
-              if asked:   # a release branch sitting on exactly that sublevel beats digging it out of history
+              if asked:
                   src = next((i for i in releases(want) if i["version"] == asked), None)
               src = src or next(releases(want), None)
               if src:
@@ -331,13 +314,10 @@ jobs:
               if len(selected) == 1 or not kmi.isdigit():
                   print(f"::error::{msg}")
                   sys.exit(1)
-              # one number typed for several families only fits one of them
               print(f"::warning::{msg} Using 'auto' for this family.")
               return None
 
           def requested(fam):
-              # bare digits -> that sublevel; a full x.y.z of this family -> as given;
-              # anything else ('LTS', blank, another family's version) -> follow the tip.
               if req_lts.isdigit():
                   return f'{fam["kver"]}.{int(req_lts)}'
               if re.fullmatch(re.escape(fam["kver"]) + r"\.\d+", req_lts):
@@ -359,12 +339,7 @@ jobs:
               entry["kmi_ref_exact"] = src["ref_exact"]
               tip = src["version"]
               if want == tip:
-                  want = None                            # that is the tip, nothing to dig for
-              # The number in the job name is read from Google's tree right now (no
-              # table of sublevels to go stale). Asking for one that isn't there yet
-              # used to "work" by renaming the tip: say no here, before an hour of
-              # sync and build - or, when several families share one number, let the
-              # ones that don't have it build their tip under its own name.
+                  want = None
               if want and tip and int(want.rsplit(".", 1)[1]) > int(tip.rsplit(".", 1)[1]):
                   msg = f"{want} does not exist on {src['branch']}, which is at {tip}."
                   if len(selected) == 1:
@@ -373,7 +348,7 @@ jobs:
                   print(f"::warning::{msg} Building {tip} for this family.")
                   want = None
               if want:
-                  entry["lts_version"] = want            # full, e.g. 6.6.150
+                  entry["lts_version"] = want
                   entry["follow_tip"] = "false"
               else:
                   entry["lts_version"] = tip or f'{fam["kver"]}-LTS'
@@ -389,9 +364,6 @@ jobs:
               out.write(f"matrix={matrix_json}\n")
           EOF
 
-  # ============================================================================
-  # JOB 2: WildKernels Fork Pipeline Mode (All Versions via .github/actions)
-  # ============================================================================
   build-fork-pipeline:
     name: "Fork Pipeline: ${{ matrix.kernel_version }} (${{ matrix.lts_version }})"
     needs: generate-matrix
@@ -461,9 +433,6 @@ jobs:
           page_size: ${{ inputs.page_size }}
           allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
 
-  # ============================================================================
-  # JOB 3: Standalone builder (6.1 / 6.6 / 6.12 + Mosey)
-  # ============================================================================
   build-all-versions-mosey:
     name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | KMI ${{ matrix.kmi_generation }} | ${{ matrix.root_variant }} + Mosey)"
     needs: generate-matrix
@@ -489,10 +458,6 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          # libdw-dev: 6.12 GKI versions symbols from DWARF, so preparing the
-          # tree for the out-of-tree modules (Mosey, Re-Kernel) builds
-          # scripts/gendwarfksyms on the runner and that needs <dwarf.h>.
-          # Kleaf brings its own for the kernel itself.
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache curl flex git git-lfs gnupg gperf \
             libdw-dev libelf-dev libncurses5-dev libssl-dev libxml2-utils lz4 pahole \
@@ -529,11 +494,6 @@ jobs:
           CURRENT_SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
           REQ_LTS="${{ matrix.lts_version }}"
 
-          # The commit that brought sublevel $1 into this branch: the oldest
-          # first-parent commit whose Makefile says so ("Merge 6.x.N into
-          # android..-lts"). Only answers once the history on disk reaches
-          # below N - on a shallow clone the first hit could be any later
-          # commit of that sublevel.
           sublevel_commit() {
             local want="$1" hit="" below="" c s
             while read -r c; do
@@ -553,10 +513,6 @@ jobs:
             return 1
           }
 
-          # 'LTS' builds whatever the manifest synced. A specific sublevel is
-          # checked out for real or the run stops: the Makefile is never edited
-          # to say a version the source isn't (that is how a 6.1.182 tree used
-          # to ship as "6.1.192").
           if [ "${{ matrix.follow_tip }}" != "true" ]; then
             TARGET_SUBLEVEL="${REQ_LTS##*.}"
             case "$TARGET_SUBLEVEL" in
@@ -571,8 +527,6 @@ jobs:
               COMMON_REV="$(cd .. && repo forall common -c 'echo "$REPO_RREV"' 2>/dev/null | head -n1 || true)"
               [ -n "$COMMON_REV" ] || COMMON_REV="${{ matrix.manifest_branch }}"
               COMMON_REV="${COMMON_REV#common-}"
-              # repo left a depth-1 clone. Walk back in steps instead of pulling
-              # the whole of kernel/common: 300 deep already covers ~20 sublevels.
               MATCH_COMMIT=""
               for depth in have 300 1500 6000 all; do
                 case "$depth" in
@@ -600,14 +554,9 @@ jobs:
 
           RESOLVED_KVER="${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
           if [ "$REQ_LTS" != "$RESOLVED_KVER" ]; then
-            # only possible on 'LTS' when the branch moved between the two jobs
             echo "::notice::job name says $REQ_LTS, the tree that was synced is $RESOLVED_KVER - the artifacts carry the real one"
           fi
 
-          # Last word on the KMI generation comes from the tree on disk, after
-          # any sublevel checkout. The phone's vendor modules only load on the
-          # generation they were built for; a kernel on another one compiles,
-          # flashes and then loops at boot, so stop here instead.
           KMI_GEN="$(sed -n 's/^KMI_GENERATION=//p' build.config.constants build.config.common 2>/dev/null | head -n1)"
           WANT_KMI="${{ matrix.kmi_generation }}"
           if [ -n "$WANT_KMI" ] && [ "$KMI_GEN" != "$WANT_KMI" ]; then
@@ -615,7 +564,7 @@ jobs:
             exit 1
           fi
           BRANCH_TAG="$(sed -n 's/^BRANCH=//p' build.config.constants build.config.common 2>/dev/null | head -n1)"
-          KMI_TAG="${BRANCH_TAG%-*}-${KMI_GEN}"    # android16-6.12 + 6 -> android16-6
+          KMI_TAG="${BRANCH_TAG%-*}-${KMI_GEN}"
 
           echo "resolved_kver=${RESOLVED_KVER}" >> "$GITHUB_OUTPUT"
           echo "resolved_sublevel=${CURRENT_SUBLEVEL}" >> "$GITHUB_OUTPUT"
@@ -627,8 +576,6 @@ jobs:
         shell: bash
         run: |
           cd kernel_workspace
-          # Prefer vendored WildKernels patches (sources/wild_patches = common/ +
-          # gki_ptrace.patch, the subset this build applies). Clone only as fallback.
           V_WILD="$GITHUB_WORKSPACE/sources/wild_patches"
           if [ -d "$V_WILD" ]; then
             echo "[+] Using vendored wild_patches from repo"
@@ -636,23 +583,13 @@ jobs:
           else
             git clone --depth=1 https://github.com/WildKernels/kernel_patches.git wild_patches
           fi
-          # Prefer the vendored susfs that ships in the repo (sources/susfs4ksu):
-          # it is already checked out at the FinaSU-pinned commit, so no clone and
-          # no git-checkout are needed and the build is reproducible / outage-proof.
-          # Fall back to cloning + pinning upstream only if it is not vendored.
           V_SUSFS="$GITHUB_WORKSPACE/sources/susfs4ksu"
-          # The kernel-side patch is one file per KMI; fs/susfs.c and the headers
-          # are the same for all three. Only take the vendored copy when it
-          # really has this family's patch.
           SUSFS_KPATCH="50_add_susfs_in_${{ matrix.susfs_branch }}.patch"
           if [ -f "$V_SUSFS/kernel_patches/$SUSFS_KPATCH" ]; then
             echo "[+] Using vendored susfs4ksu from repo (FinaSU-pinned v2.3.0, $SUSFS_KPATCH)"
             rm -rf susfs4ksu && cp -a "$V_SUSFS" susfs4ksu
           else
             git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || true
-            # FinaSU pins SUSFS to a specific commit (its hook model differs from the
-            # branch tip; HEAD panics in early boot). Pin it - see FinaSU builtin docs.
-            # Same v2.3.0 commit on each branch (pushed together, 2026-10-19).
             case "${{ matrix.susfs_branch }}" in
               gki-android14-6.1)  SUSFS_PIN="b57ed1998b82c4e3a2a81cdbf11172a560979c40" ;;
               gki-android15-6.6)  SUSFS_PIN="4a4cb1be85a4694372d3efb9420de69982eac29a" ;;
@@ -683,10 +620,6 @@ jobs:
             exit 0
           fi
 
-          # Where each manager's kernel tree comes from. FinaSU is vendored-style
-          # (full clone + a pinned commit, because its Kbuild reads KSU_VERSION
-          # from git history and its headers symlink into the repo root); the
-          # rest are a shallow clone of the branch that carries drivers/kernelsu.
           ROOT_BRANCH=""
           case "$VARIANT" in
             FinaSU)        ROOT_REPO="https://github.com/LyraVoid/FinaSU.git";            ROOT_DIR="FinaSU" ;;
@@ -695,7 +628,6 @@ jobs:
             SukiSU-Ultra)  ROOT_REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git";  ROOT_DIR="SukiSU-Ultra";  ROOT_BRANCH="main" ;;
             KowSU)         ROOT_REPO="https://github.com/KOWX712/KernelSU.git";           ROOT_DIR="KowSU";         ROOT_BRANCH="master" ;;
             KernelSU-Next)
-              # the susfs-aware fork when SUSFS is on, else upstream next
               if [ "${{ inputs.enable_susfs }}" = "true" ]; then
                 ROOT_REPO="https://github.com/pershoot/KernelSU-Next.git";  ROOT_DIR="KernelSU-Next"; ROOT_BRANCH="dev-susfs"
               else
@@ -736,10 +668,6 @@ jobs:
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
           fi
 
-          # FinaSU only: bake its manager's signing cert as the auto-trusted
-          # slot (else the manager shows "Not installed"). Computed from the
-          # latest manager APK, with a known v1.4.x fallback. The other managers
-          # trust their app at runtime, so there is nothing to bake for them.
           if [ "$VARIANT" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
             FINA_SZ="0x02cc"
             FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
@@ -774,11 +702,6 @@ jobs:
           KVER_SHORT="${{ matrix.kver }}"
           SUBLEVEL="${{ steps.sync-kernel.outputs.resolved_sublevel }}"
 
-          # 1. SUSFS (FinaSU carries susfs natively: kernel-side 50_add only).
-          # Only the patch written for this KMI goes in. A 6.6 patch on a 6.12
-          # tree "applies" with enough fuzz and leaves rejects behind, and the
-          # result is a kernel missing some of its hooks - so a missing patch
-          # or any reject stops the build here instead.
           if [ "${{ inputs.enable_susfs }}" = "true" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
             SUSFS_PATCH="$SUSFS_DIR/kernel_patches/50_add_susfs_in_${{ matrix.susfs_branch }}.patch"
             if [ ! -f "$SUSFS_PATCH" ]; then
@@ -792,19 +715,12 @@ jobs:
             cd common
             find . -name "*.rej" -delete || true
             echo "[+] Applying $(basename "$SUSFS_PATCH")"
-            # patch's own default fuzz (2), not 3: these hunks carry three lines
-            # of context, so fuzz 3 means "ignore all of it and go by line
-            # number". On 6.12.81 that dropped two show_smaps_rollup hunks into
-            # the middle of unrelated code and still said "succeeded". The patch
-            # is written for the newer release branch (6.12.92 takes it with no
-            # fuzz at all); a tree it doesn't fit has to fail here.
             if ! patch -p1 --forward < "$SUSFS_PATCH"; then
               echo "::error::SUSFS patch does not fit ${{ matrix.gki_branch }} ($KVER_SHORT.$SUBLEVEL): it is written for a different sublevel of this family. Build the branch 'LTS' picks instead of this sublevel."
               find . -name "*.rej" | sed 's/^/  reject: /'
               exit 1
             fi
 
-            # utf8-norm bypass fix (6.1+ variant)
             U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch"
             [ -f "$U" ] && patch -p1 --forward --fuzz=3 < "$U" || true
           else
@@ -813,21 +729,13 @@ jobs:
 
           find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
 
-          # 2. Baseband Guard (BBG) - always on
           if true; then
             echo "[+] Integrating Baseband Guard (BBG)..."
             BV="$GITHUB_WORKSPACE/sources/baseband-guard"
             if [ -d "$BV" ]; then
-              # Vendored + pinned copy, wired by hand: the same three things
-              # upstream's setup.sh does on a DEFINE_LSM tree (symlink, Makefile
-              # line, Kconfig source). setup.sh expects a checkout it can pull
-              # and only gave "pathspec 'main'" / "no tracking information"
-              # noise against a vendored directory.
               echo "[+] Using vendored Baseband-guard from repo (pinned)"
               rm -rf Baseband-guard security/baseband-guard
               cp -a "$BV" Baseband-guard
-              # its Makefile asks git for a version string; keep that lookup
-              # inside this directory so it can't pick up the kernel's own repo
               git -C Baseband-guard init -q 2>/dev/null || true
               git -C Baseband-guard remote add origin https://github.com/vc-teahouse/Baseband-guard 2>/dev/null || true
               ln -sfn ../Baseband-guard security/baseband-guard
@@ -844,12 +752,6 @@ jobs:
             else
               curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
             fi
-            # wild_patches/common/bbg/ is left out on purpose: both files are for
-            # the OnePlus "efisp" bootloader exploit (an AnyKernel3 flash menu and
-            # an abl/efisp allowlist keyed on oplusboot.secure_user_mode). Nothing
-            # in there is for a Pixel, and the old blanket `find *bbg*.patch` fed
-            # the AnyKernel3 one to the kernel tree, where it can never apply.
-            # The LSM list entry is separate from the source wiring; add it here.
             if [ -d security/baseband-guard ]; then
               sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
               DEF="arch/arm64/configs/gki_defconfig"
@@ -862,21 +764,15 @@ jobs:
             fi
           fi
 
-          # 2b. NV write guard - always on. Protects the modem's nv_protected.bin
-          # (RF cal / IMEI) from stray writes; nv_normal.bin stays writable.
           if true; then
             echo "[+] Integrating NV write guard (nv_guard LSM)..."
             NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
-            # Copy the sources in (version-independent) rather than a context patch.
             if [ ! -f security/nv_guard/nv_guard.c ] && [ -f "$NVD/nv_guard.c" ]; then
               mkdir -p security/nv_guard
               cp "$NVD/nv_guard.c" "$NVD/Kconfig" "$NVD/Makefile" security/nv_guard/
               echo "[+] nv_guard sources copied into security/nv_guard/"
             fi
             if [ -f security/nv_guard/nv_guard.c ]; then
-              # Wire Kconfig/Makefile by anchor, idempotently - no diff to fuzz.
-              # keys/Kconfig is the first `source` inside the security menu on
-              # every GKI version, so inserting after it is always in-menu.
               grep -q 'security/nv_guard/Kconfig' security/Kconfig || \
                 sed -i 's#^source "security/keys/Kconfig"#&\nsource "security/nv_guard/Kconfig"#' security/Kconfig
               grep -q 'nv_guard/' security/Makefile || \
@@ -893,12 +789,6 @@ jobs:
             fi
           fi
 
-          # 2b-slots. From 6.12 the LSM core sizes its static-call pool from the
-          # in-tree LSMs only (include/linux/lsm_count.h). Without a slot each,
-          # the two guards above compile and then never run ("out of LSM static
-          # calls!?" at boot) and bpf falls off the end of CONFIG_LSM with them.
-          # No-op on 6.1 / 6.6. Fail loud: a guard that silently isn't there is
-          # worse than a failed build.
           if [ -d security/baseband-guard ] || [ -f security/nv_guard/nv_guard.c ]; then
             if ! sh "$GITHUB_WORKSPACE/kernel-patches/lsm-slots/add-lsm-slots.sh" .; then
               echo "::error::could not reserve LSM slots for Baseband-guard / nv_guard"
@@ -906,15 +796,6 @@ jobs:
             fi
           fi
 
-          # 2b-usb. USB hardening - always on. Two runtime kill switches the
-          # "USB Manager" root module flips: kernel.deny_new_usb (host side,
-          # refuses enumeration of newly inserted devices) and
-          # kernel.deny_usb_gadget (peripheral side, drops the gadget pullup so
-          # the device can't present itself to a host). Both default to 0, so
-          # the kernel stays stock until userspace writes them, and both are
-          # KMI-safe (file-scope statics + register_sysctl only - no exported
-          # symbol, signature or module-visible struct touched). Fail loud: a
-          # security gate that silently fell out is worse than a failed build.
           if true; then
             echo "[+] Applying USB hardening switches (deny_new_usb + deny_usb_gadget)..."
             USBD="$GITHUB_WORKSPACE/kernel-patches/usb-hardening"
@@ -937,13 +818,6 @@ jobs:
             fi
           fi
 
-          # 2b-hard. Extra kernel hardening - always on, defaults safe. Codegen /
-          # instrumentation only, so no KMI symbol-list or struct change: zero
-          # call-used regs on return, fatal list corruption (6.6+), and dmesg
-          # locked to CAP_SYSLOG from boot. The runtime sysctl bundle that pairs
-          # with these lives in kernel-patches/hardening/ and is applied by a root
-          # module (DaddyUSB), not baked here. olddefconfig drops any symbol a
-          # given tree lacks, so this never fails the build.
           if true; then
             echo "[+] Applying @Dev_DcS kernel hardening config..."
             DEF="arch/arm64/configs/gki_defconfig"
@@ -960,11 +834,6 @@ jobs:
             echo "[+] hardening config appended"
           fi
 
-          # 2b-ptrace. TracerPid leak fix - always on, default 0. Adds
-          # kernel.hide_tracerpid: when set, /proc/<pid>/status TracerPid reads 0
-          # so anti-debug / anti-Frida checks can't spot a ptrace injection
-          # (Zygisk, Frida, gdb). KMI-safe (file-scope static + register_sysctl,
-          # task_state stays static). Fail loud, like the USB gates.
           if true; then
             echo "[+] Applying TracerPid leak fix (hide_tracerpid)..."
             TPP="$GITHUB_WORKSPACE/kernel-patches/hardening/0001-proc-hide-tracerpid.patch"
@@ -982,16 +851,6 @@ jobs:
             fi
           fi
 
-          # 2c. Security patch level.
-          #   monthly    - whatever the base sync pulled (latest tagged GKI/LTS).
-          #                That already IS the Android monthly CVE set, merged
-          #                and tested together upstream. Nothing extra to do.
-          #   latest-cve - also fast-forward this series' post-release stable
-          #                CVE fixes on top (git am --3way). Anything that does
-          #                not apply cleanly is ABORTED and logged, never fuzzed
-          #                in. Bleeding edge; may apply nothing if the base tag
-          #                is not reachable in the synced tree. See README.
-          #   none       - build the base exactly as pinned.
           case "${{ inputs.security_patches }}" in
             latest-cve)
               echo "[+] security_patches=latest-cve: topping up with post-release stable CVE fixes..."
@@ -1002,11 +861,7 @@ jobs:
               OUTD="$GITHUB_WORKSPACE/cve-out"; mkdir -p "$OUTD"
               OKF="$OUTD/cve-applied.txt"; SKF="$OUTD/cve-skipped.txt"; : > "$OKF"; : > "$SKF"
               STABLE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git"
-              # The synced Android tree never carries upstream stable tags, so the
-              # base tag has to come from linux-stable too, or it's never found.
               if git fetch --no-tags --depth=400 "$STABLE" "linux-${SERIES}.y:refs/cve_tip" "refs/tags/v${KVER}:refs/tags/v${KVER}" 2>/dev/null; then
-                # The base must sit inside the fetched history, otherwise rev-list
-                # walks past it into commits the tree already has. Deepen until it does.
                 for d in 800 1600 3200; do
                   git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null && break
                   git fetch --no-tags --deepen="$d" "$STABLE" "linux-${SERIES}.y:refs/cve_tip" 2>/dev/null || break
@@ -1039,16 +894,9 @@ jobs:
               ;;
           esac
 
-          # 3. NTSync. drivers/misc/ntsync.c ships only on 6.12; every other
-          # family needs ntsync_base.patch to ADD it, plus a per-family compat
-          # patch that wires Kconfig/Makefile. The old `find -path "*6.6*"` only
-          # matched the compat patch (ntsync_base has no version in its name),
-          # so CONFIG_NTSYNC=y referenced a drivers/misc/ntsync.o whose source
-          # was never created -> "No rule to make target drivers/misc/ntsync.o".
           if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ]; then
             echo "[+] Applying NTSync for ${{ matrix.kernel_version }}..."
             NT="$PATCH_DIR/common/ntsync"
-            # 6.12 already carries ntsync.c/.h; drop them so base re-adds a known copy
             if [ "${{ matrix.kernel_version }}" = "android16-6.12" ]; then
               rm -f include/uapi/linux/ntsync.h drivers/misc/ntsync.c
             fi
@@ -1057,32 +905,15 @@ jobs:
             if [ -f "$NT/ntsync_base.patch" ]; then patch -p1 --forward --fuzz=3 < "$NT/ntsync_base.patch" || true; else echo "::warning::NTSync: ntsync_base.patch not found"; fi
           fi
 
-          # 4. Networking (BBRv3 / Netfilter for matching kernel series)
           if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
             echo "[+] Applying Networking patches for ${KVER_SHORT}..."
             find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
           fi
 
-          # 5. DroidSpaces-OSS - complete GKI container / Docker kernel patch set.
-          #    The vendored files don't carry "droidspaces" in their names, so the
-          #    old "*droidspaces*.patch" glob matched nothing and silently applied
-          #    zero of them. Name each file we actually want instead. Three patches,
-          #    all under the one DroidSpaces switch:
-          #      - ghost-task (pid.c): KMI-neutral runtime guard the PID-ns path
-          #        leans on (stops a null-task deref).
-          #      - USER_NS guard (user_namespace.c): the doc's fix for Docker's
-          #        "unsafe /proc" refusal once CONFIG_USER_NS is on - it blocks
-          #        unprivileged userns creation for non-root, the exact surface
-          #        Android disables USER_NS over. KMI-neutral.
-          #      - SysV IPC kABI relocation: per KMI generation, see below.
-          #    The 5.10-and-below posix_mqueue padding patch is NOT used: on 6.x
-          #    POSIX_MQUEUE touches no KMI field. @Dev_DcS
           if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
             echo "[+] Applying DroidSpaces-OSS kernel patches..."
             DSP="$PATCH_DIR/common/droidspaces"
 
-            # dry-run gated, warn-on-miss: these are fixups, not boot-critical, so
-            # a layout drift downgrades to a warning instead of failing the build.
             apply_dsp_soft() {
               f="$1"; label="$2"
               if [ ! -f "$f" ]; then echo "::warning::DroidSpaces: $label patch not found ($f)"; return; fi
@@ -1095,22 +926,6 @@ jobs:
             apply_dsp_soft "$DSP/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" "ghost-task pid.c guard"
             apply_dsp_soft "$DSP/0001-Guard-USER_NS-for-non-root-users.patch" "USER_NS non-root guard"
 
-            # SysV IPC kABI relocation - MANDATORY with CONFIG_SYSVIPC (set in the
-            # config step). CONFIG_SYSVIPC adds task_struct.sysvsem (8B) + sysvshm
-            # (16B); left inline they shift every later field and shatter the
-            # vendor-module KMI -> instant bootloop. The patch moves both into
-            # reserved ANDROID_KABI padding so the symbol CRC and every field
-            # offset stay byte-identical to stock. The DroidSpaces doc splits the
-            # relocation by KMI generation, so pick per family:
-            #   6.1 / 6.6 (KMI < 6.12): fix_sysvipc_kabi_6_7_8.patch - packs into
-            #       the free reserved slots 6/7/8 (verified free: 6.1 uses 1-3,
-            #       6.6 uses 1-2). Proven CRC-identical under genksyms + compiles.
-            #   6.12+:                  fix_sysvipc_kabi_a16-6.12.patch - the doc's
-            #       6.12 variant (gendwarfksyms __kabi_ignored unions). Compiles.
-            # STRICT: if the chosen patch does not apply we abort - shipping
-            # CONFIG_SYSVIPC without its relocation is an instant bootloop, and a
-            # reject usually means a reserved slot stopped being free, which is
-            # exactly when we must stop. @Dev_DcS
             case "$KVER_SHORT" in
               6.12|6.13|6.14|6.15) KABI="$DSP/fix_sysvipc_kabi_a16-6.12.patch"; SLOTS="gendwarfksyms __kabi_ignored unions" ;;
               *)                   KABI="$DSP/fix_sysvipc_kabi_6_7_8.patch";    SLOTS="ANDROID_KABI reserved slots 6/7/8" ;;
@@ -1127,14 +942,6 @@ jobs:
             echo "  [ok]   SysV IPC kABI relocation applied (task_struct CRC unchanged)"
           fi
 
-          # 6. Performance tuning patches.
-          # Do NOT point this at wild_patches/wild: that tree is archived SUSFS
-          # fix-ups for old 5.x/preview layouts (base.c, fdinfo.c, task_mmu.c),
-          # manual hook patches and KSU-Next bundles. Run with --fuzz over a
-          # current 6.x tree they stack stale code on top of SUSFS - that is what
-          # broke fs/proc/base.c here (BIT_SUS_MAPS / vma) and fs/notify/fdinfo.c
-          # before. Only the real perf patches from common/, each one that does
-          # not apply cleanly is skipped (dry-run first) instead of fuzzing in.
           if [ "${{ inputs.enable_performance }}" = "true" ]; then
             echo "[+] Applying WildKernels performance patches..."
             for name in \
@@ -1158,7 +965,6 @@ jobs:
             done
           fi
 
-          # 7. Module Check Bypass
           if [ "${{ inputs.allow_version_mismatch }}" = "true" ] && [ -f kernel/module/version.c ]; then
             echo "[+] Applying Module Check Bypass..."
             sed -i 's/return 0;/return 1;/g' kernel/module/version.c || true
@@ -1171,13 +977,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # GKI ships cfg80211 as a vendor module and never builds mac80211 into
-          # the image, so the old in-tree mac80211 driver + forced
-          # CONFIG_CFG80211/MAC80211=y both broke the build and would clash with
-          # the phone's own Wi-Fi stack. This driver is cfg80211-only, built
-          # out-of-tree below against the finished kernel and shipped as its own
-          # KSU/Magisk module; the kernel image is left exactly as a normal Wild
-          # build produces it.
           SRC="$GITHUB_WORKSPACE/mosey_src"
           rm -rf "$SRC"; mkdir -p "$SRC"
 
@@ -1613,8 +1412,6 @@ jobs:
           CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
         run: |
           cd kernel_workspace/common
-          # Clean uname insurance: empty .scmversion -> setlocalversion emits
-          # nothing if a build is ever stamped (stamp.bzl strip covers non-stamp).
           : > .scmversion 2>/dev/null || true
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
@@ -1630,23 +1427,16 @@ jobs:
             fi
           }
 
-          # Strip the -dirty / -maybe-dirty scm markers so uname stays clean,
-          # and pin LOCALVERSION_AUTO=n so no git suffix is ever appended.
           if [ -f scripts/setlocalversion ]; then
             sed -i 's/-maybe-dirty//g; s/-dirty//g' scripts/setlocalversion
           fi
-          # the real -maybe-dirty is Kleaf's non-stamp placeholder in stamp.bzl
           sed -i 's/-maybe-dirty//g' ../build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           set_kconfig CONFIG_LOCALVERSION_AUTO n
 
-          # Custom kernel name (env var, sanitized against shell injection)
           if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
             KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
             if [ -n "$KN" ]; then
               set_kconfig CONFIG_LOCALVERSION "\"-$KN\""
-              # 6.6+ Kleaf merges a page-size fragment on top of the defconfig
-              # for the 16k kernel, and that fragment blanks CONFIG_LOCALVERSION
-              # again - so the name has to go in there too or 16k builds lose it
               PS_FRAG="../build/kernel/kleaf/impl/defconfig/arm64_16k_defconfig"
               if grep -qs '^CONFIG_LOCALVERSION=' "$PS_FRAG"; then
                 sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-$KN\"/" "$PS_FRAG"
@@ -1655,12 +1445,7 @@ jobs:
             fi
           fi
 
-          # Disable CONFIG_WERROR so unused-variable warnings in patched files never fail the build
           set_kconfig CONFIG_WERROR n
-          # ZRAM default compressor (@Dev_DcS). lz4 is the fastest and the
-          # default; zstd trades a little CPU for a notably higher ratio (more
-          # effective RAM). Both are in the GKI crypto set - we just enable the
-          # backend and point ZRAM's default at it. Runtime can still override.
           case "${{ inputs.zram_algo }}" in
             zstd)
               set_kconfig CONFIG_CRYPTO_ZSTD y
@@ -1690,23 +1475,14 @@ jobs:
             set_kconfig CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
             set_kconfig CONFIG_KSU_SUSFS_OPEN_REDIRECT y
             set_kconfig CONFIG_KSU_SUSFS_SUS_MAP y
-            # Inline hook backend: FinaSU + the SUSFS patch panics on Tracepoint
-            # (double-hook, stuck at the Google logo), so force Inline.
             set_kconfig CONFIG_KSU_HOOK_SUSFS_INLINE y
             set_kconfig CONFIG_KSU_HOOK_TRACEPOINT n
           fi
 
-          # shell->su transition hide (option C). Independent of SUSFS; inert
-          # unless the hide_shell_su.c/.h patch is in the SELinux tree.
           if [ "${{ inputs.hide_shell_su }}" = "true" ]; then
             set_kconfig CONFIG_SELINUX_HIDE_SHELL_SU_TRANS y
           fi
 
-          # Metamodule prep. Every engine but 'none' wants tmpfs xattr + POSIX
-          # ACLs; the OverlayFS engines (Mountify, Hybrid) also want
-          # CONFIG_OVERLAY_FS=y. The VFS engines (NoMount, ZeroMount) are
-          # kernel-side but their drivers ride in with the WildKernels/SUSFS
-          # patches - here we just guarantee the configs they all lean on.
           if [ "${{ inputs.metamodule }}" != "none" ]; then
             set_kconfig CONFIG_TMPFS_XATTR y
             set_kconfig CONFIG_TMPFS_POSIX_ACL y
@@ -1715,43 +1491,18 @@ jobs:
             esac
           fi
 
-          # DroidSpaces / containers - the complete GKI-ABI-safe container set
-          # (from DroidSpaces-OSS Kernel-Configuration.md). Android ships
-          # NAMESPACES=y but turns PID_NS off (and IPC_NS with it), so a container
-          # manager reports "PID/IPC namespace not supported" and won't start. The
-          # heavy stack Docker needs - VETH, BRIDGE, NETFILTER, NF_CONNTRACK,
-          # NF_NAT, MASQUERADE, cgroups, MEMCG, OVERLAY_FS - is already =y in
-          # gki_defconfig on all three families, so we add only what is genuinely
-          # off, and only options the doc certifies GKI-ABI-safe. We deliberately
-          # do NOT touch CGROUP_DEVICE / CGROUP_PIDS: enabling a cgroup controller
-          # bumps CGROUP_SUBSYS_COUNT, which resizes css_set.subsys[] - a KMI
-          # struct - and breaks vendor modules. That ABI cost is exactly why
-          # DroidSpaces leaves them off on GKI, and containers still run. @Dev_DcS
           if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
-            # Namespaces. UTS_NS/NET_NS already ride in on NAMESPACES=y; we pin
-            # them so a defconfig change can't silently drop them underneath us.
-            set_kconfig CONFIG_PID_NS y        # off in gki_defconfig; fatal if missing
+            set_kconfig CONFIG_PID_NS y
             set_kconfig CONFIG_UTS_NS y
             set_kconfig CONFIG_NET_NS y
-            set_kconfig CONFIG_IPC_NS y        # fatal if missing
-            set_kconfig CONFIG_USER_NS y       # doc: clears Docker's unsafe-/proc refusal; the USER_NS patch guards it for non-root
-            # IPC. SYSVIPC is the one option that reaches into task_struct; its
-            # kABI relocation patch is applied and STRICTLY gated in the patch
-            # step, which aborts the whole job if the relocation didn't land - so
-            # CONFIG_SYSVIPC never ships without it. It pulls SYSVIPC_SYSCTL/
-            # _COMPAT in on its own. The post-build KMI check is the backstop; the
-            # task_struct CRC reads byte-identical to stock after relocation.
+            set_kconfig CONFIG_IPC_NS y
+            set_kconfig CONFIG_USER_NS y
             set_kconfig CONFIG_SYSVIPC y
             set_kconfig CONFIG_POSIX_MQUEUE y
-            # Device nodes + overlay (volatile mode) + tmpfs attrs.
-            set_kconfig CONFIG_DEVTMPFS y      # DroidSpaces sets up /dev
-            set_kconfig CONFIG_OVERLAY_FS y    # volatile mode
+            set_kconfig CONFIG_DEVTMPFS y
+            set_kconfig CONFIG_OVERLAY_FS y
             set_kconfig CONFIG_TMPFS_POSIX_ACL y
             set_kconfig CONFIG_TMPFS_XATTR y
-            # Netfilter / ipset extras the doc lists as GKI-safe - self-contained
-            # xt_*/ip_set modules that add no field to sk_buff or task_struct.
-            # addrtype is required for container NAT; the rest back UFW / Fail2ban
-            # firewalling inside NAT-mode containers.
             set_kconfig CONFIG_NETFILTER_XT_MATCH_ADDRTYPE y
             set_kconfig CONFIG_NETFILTER_XT_TARGET_REJECT y
             set_kconfig CONFIG_NETFILTER_XT_TARGET_LOG y
@@ -1767,13 +1518,6 @@ jobs:
             set_kconfig CONFIG_WIREGUARD y
             set_kconfig CONFIG_TCP_CONG_ADVANCED y
             set_kconfig CONFIG_TCP_CONG_BBR y
-            # Turning ADVANCED on exposes the optional congestion-control algos.
-            # On a tree whose stock defconfig didn't already pin them (6.1: it
-            # has no TCP_CONG lines at all) they default to =m, and those .ko
-            # are not in Google's module_outs, so Kleaf's module check kills the
-            # build. Google's own 6.6/6.12 defconfig ships ADVANCED=y with these
-            # three set "not set" for exactly this reason - mirror it so no
-            # undeclared tcp_cong_*.ko is produced. BBR stays, CUBIC is default.
             set_kconfig CONFIG_TCP_CONG_BIC n
             set_kconfig CONFIG_TCP_CONG_WESTWOOD n
             set_kconfig CONFIG_TCP_CONG_HTCP n
@@ -1783,16 +1527,6 @@ jobs:
             set_kconfig CONFIG_IP_SET_MAX 256
             set_kconfig CONFIG_NETFILTER_XT_TARGET_HL y
             set_kconfig CONFIG_NETFILTER_XT_TARGET_CONNMARK y
-            # From 6.8 CIFS selects NETFS_SUPPORT. On android16-6.12 netfs.ko is
-            # one of the GKI modules Kleaf has to hand back (and the one the
-            # phone already carries in system_dlkm); CIFS=y drags netfs into
-            # the image, the module is never produced and the build stops on
-            # it. Where that's the case keep the stock module set and leave
-            # CIFS out. Building netfs in instead was considered and dropped:
-            # it means cutting netfs.ko out of Google's module list and
-            # shipping an image whose module set no longer matches the
-            # system_dlkm on the phone, all for an in-kernel SMB client that
-            # apps already replace in userspace. Not worth a boot risk.
             if grep -q 'fs/netfs/netfs.ko' modules.bzl 2>/dev/null && \
                grep -q 'select NETFS_SUPPORT' fs/smb/client/Kconfig 2>/dev/null; then
               echo "[i] CIFS left out on ${{ matrix.kernel_version }}: it would turn the GKI module netfs.ko into a built-in"
@@ -1807,21 +1541,15 @@ jobs:
             set_kconfig CONFIG_DEBUG_INFO_BTF y
           fi
 
-          # only enable NTSync if its source actually made it into the tree,
-          # else built-in.a references a drivers/misc/ntsync.o with no source
           if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
             set_kconfig CONFIG_NTSYNC y
           fi
 
-          # (Mosey no longer forces cfg80211/mac80211/nlmon into the image;
-          #  the wonder phy is a separate out-of-tree module - see below.)
 
-          # Remove check_defconfig and relax KMI symbol trimming in legacy build configs
           sed -i 's/check_defconfig//' build.config.gki* || true
           sed -i 's/TRIM_NONLISTED_KMI=1/TRIM_NONLISTED_KMI=0/g' build.config.gki* || true
           sed -i 's/KMI_SYMBOL_LIST_STRICT_MODE=1/KMI_SYMBOL_LIST_STRICT_MODE=0/g' build.config.gki* || true
 
-          # Empty protected exports files in-place and disable strict KMI trimming (without deleting lines)
           for f in android/abi_gki_protected_exports_*; do
             [ -f "$f" ] && : > "$f"
           done
@@ -1832,14 +1560,6 @@ jobs:
             fi
           done
 
-          # The Kleaf that android16-6.12 syncs (main-kernel-2025) ignores the
-          # check_defconfig line removed from build.config above: common_kernel()
-          # itself runs `make savedefconfig` and diffs it against gki_defconfig
-          # ("minimized"), so every option appended here fails the build with
-          # "savedefconfig does not match". Switch that check off for the GKI
-          # targets - the attribute is the supported way, the default in
-          # common_kernels.bzl is flipped too in case the attribute moves.
-          # Older trees (define_common_kernels) have neither and are untouched.
           if [ -f BUILD.bazel ] && grep -q '^common_kernel($' BUILD.bazel; then
             for t in kernel_aarch64 kernel_aarch64_16k; do
               if grep -q "^    name = \"$t\",\$" BUILD.bazel && \
@@ -1863,11 +1583,6 @@ jobs:
 
           if [ "${{ matrix.build_tool }}" = "bazel" ] || { [ "${{ matrix.build_tool }}" = "auto" ] && [ -x tools/bazel ]; }; then
             echo "[+] Building ${{ matrix.kernel_version }} with Kleaf / Bazel (page_size=${{ inputs.page_size }})..."
-            # The 16k kernel is a target of its own. Its _dist rule is made by a
-            # macro, so that name is written nowhere and the old grep for
-            # "kernel_aarch64_16k_dist" never matched: 16k quietly built 4k.
-            # Look for the kernel target instead - older Kleaf declares it in
-            # common_kernels.bzl, the 6.12 one in common/BUILD.bazel.
             KTARGET="kernel_aarch64"
             if [ "${{ inputs.page_size }}" = "16k" ]; then
               if grep -qs '"kernel_aarch64_16k"' common/BUILD.bazel build/kernel/kleaf/common_kernels.bzl; then
@@ -1879,11 +1594,6 @@ jobs:
             fi
             echo "KTARGET=$KTARGET" >> "$GITHUB_ENV"
             BAZEL_TARGET="//common:${KTARGET}_dist"
-            # The dist target changed under the hood: older Kleaf (6.1 / 6.6
-            # manifests) uses copy_to_dist_dir and takes --dist_dir, the one
-            # android16-6.12 syncs uses rules_pkg's pkg_install, which only
-            # knows --destdir and exits on anything else - after the whole
-            # kernel has already been built.
             DIST_OUT="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
             if grep -q 'pkg_install' build/kernel/kleaf/common_kernels.bzl 2>/dev/null; then
               DIST_FLAG="--destdir=$DIST_OUT"
@@ -1903,8 +1613,6 @@ jobs:
             LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 DIST_DIR="$GITHUB_WORKSPACE/kernel_workspace/out/dist" build/build.sh
           fi
 
-          # Trust the Image, not the label: the arm64 header carries the page
-          # size it was built for (flags at offset 24, bits 1-2; "ARMd" at 56).
           IMG="out/dist/Image"
           [ -f "$IMG" ] || IMG="bazel-bin/common/${KTARGET:-kernel_aarch64}/Image"
           if [ -f "$IMG" ] && [ "$(od -An -tx4 -j56 -N4 "$IMG" | tr -d ' ')" = "644d5241" ]; then
@@ -1925,11 +1633,6 @@ jobs:
         working-directory: ${{ github.workspace }}/kernel_workspace
         run: |
           set -uo pipefail
-          # The phone's vendor modules carry a CRC for every kernel symbol they
-          # import and refuse to load if the kernel's differs. Same compiler,
-          # same branch: every CRC Google's build exports has to come out
-          # identical here, and a patch or config switch that bends a struct
-          # shows up as a difference right now rather than as a bootloop.
           TARGET="${KTARGET:-kernel_aarch64}"
           REF="${{ matrix.kmi_ref_branch }}"
           MINE="$(find out/dist "bazel-bin/common/$TARGET" -maxdepth 2 -name vmlinux.symvers 2>/dev/null | head -n1 || true)"
@@ -1979,7 +1682,6 @@ jobs:
 
           changed = sorted(s for s in theirs if s in mine and mine[s] != theirs[s])
           missing = sorted(s for s in theirs if s not in mine)
-          # no Pixel list in this tree: then every symbol Google exports counts
           hits = [s for s in changed + missing if not pixel or s in pixel]
 
           print(f"[i] compared with Google's {ref} build {bid}: {len(theirs)} exported symbols, "
@@ -1998,8 +1700,6 @@ jobs:
               echo "::error::KMI broken: $MSG. Something in this build changed the ABI - not packaging a kernel that would loop at boot."
               exit 1
             fi
-            # -lts runs ahead of the release it is compared with, so there this
-            # is a heads-up and the flash guard and the phone have the last word
             echo "::warning::KMI differs: $MSG."
           elif [ "$rc" -ne 0 ]; then
             echo "::warning::KMI comparison did not run to the end (rc=$rc)"
@@ -2016,7 +1716,6 @@ jobs:
           SRC="$GITHUB_WORKSPACE/mosey_src"
           OBJ="$RUNNER_TEMP/mosey_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
 
-          # finished .config, Image and symvers, in either layout (bazel / build.sh)
           cfg=""
           for c in bazel-bin/common/${KTARGET:-kernel_aarch64}_config/out_dir/.config out/dist/.config out/.config; do
             [ -f "$c" ] && { cfg="$c"; break; }
@@ -2032,11 +1731,9 @@ jobs:
             exit 0
           fi
 
-          # read the release from the Image so vermagic matches byte for byte
           krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"
           [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
 
-          # same prebuilt clang the kernel used (repo-synced under kernel_workspace)
           clang_ver="$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null | head -n1 || true)"
           clang_bin="$(sed -n 's/^CLANG_PREBUILT_BIN=//p' common/build.config.common 2>/dev/null | head -n1 || true)"
           clang_bin="${clang_bin//\$\{CLANG_VERSION\}/$clang_ver}"
@@ -2053,16 +1750,6 @@ jobs:
           export PATH="$PWD/$clang_bin:$PATH"
 
           cp "$cfg" "$OBJ/.config"
-          # 6.12 GKI has CONFIG_RUST=y; a C module never needs it and the runner
-          # has no matching rustc, so switch it off rather than let olddefconfig guess
-          # RUST: a C module never needs it and the runner has no matching rustc.
-          # TRIM_UNUSED_KSYMS: on (older) GKI like 6.1 the synced .config carries
-          # it, which makes modules_prepare regenerate autoksyms.h from an ABI
-          # whitelist (abi_symbollist.raw) that isn't in this standalone module
-          # tree -> "whitelist file not found" and the module is skipped. Trimming
-          # unused exports is a whole-kernel step that means nothing for one
-          # out-of-tree .ko (the real kernel was already built by Kleaf), so drop
-          # it here. 6.6/6.12 don't set it; disabling it there is a no-op.
           if [ -f common/scripts/config ]; then
             common/scripts/config --file "$OBJ/.config" --disable RUST --disable TRIM_UNUSED_KSYMS || true
           fi
@@ -2074,8 +1761,6 @@ jobs:
           echo "$krel" > "$OBJ/include/config/kernel.release"
           printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
 
-          # vmlinux CRCs from the real build; cfg80211 symbols stay unversioned
-          # on purpose (they resolve against the phone's own cfg80211.ko)
           sv="$(find "bazel-bin/common/${KTARGET:-kernel_aarch64}" out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
           if [ -n "$sv" ]; then cp "$sv" "$OBJ/Module.symvers"; else echo "::warning::Mosey: no symvers, core symbols unversioned"; fi
 
@@ -2089,11 +1774,6 @@ jobs:
             *) echo "::warning::Mosey: vermagic '$vermagic' does not start with $krel" ;;
           esac
 
-          # ---- package the module around the freshly-built .ko
-          # Preferred: bake the .ko into the full Mosey enabler committed at
-          # mosey/enabler/ (feelliao's userspace stack + our wonder-load.sh), so
-          # one flashable zip carries both halves. Fallback: a minimal module
-          # that only loads the wonder phy, for when the repo has no enabler.
           ENABLER="$GITHUB_WORKSPACE/mosey/enabler"
           PKG="$GITHUB_WORKSPACE/mosey_wonder/pkg"
           rm -rf "$GITHUB_WORKSPACE/mosey_wonder"; mkdir -p "$PKG"
@@ -2188,8 +1868,6 @@ jobs:
             MODNAME="Mosey-wonder"
           fi
 
-          # drop in the kernel-specific .ko + chosen MAC; wonder-load.sh (shipped
-          # in the enabler) insmods it at boot, no-op if a native wonder phy exists
           cp "$ko" "$PKG/wonder_mosey_wild.ko"
           echo "${{ inputs.mosey_mac_addr }}" > "$PKG/mac_addr"
           for s in post-fs-data.sh wonder-load.sh service.sh post-mount.sh boot-completed.sh                    customize.sh uninstall.sh action.sh mosey-control.sh                    META-INF/com/google/android/update-binary; do
@@ -2236,11 +1914,6 @@ jobs:
             exit 1
           fi
 
-          # Flash-time guard. A GKI Image only runs with vendor modules built for
-          # the same KMI generation and page size; get either wrong and the phone
-          # just loops at boot (a generation-7 build on a generation-6 Pixel 10
-          # did exactly that). The zip now compares itself with the kernel that
-          # is running and refuses before it writes anything.
           KMI_TAG="${{ steps.sync-kernel.outputs.kmi_tag }}"
           cat > AnyKernel3/tools/kmi-guard.sh <<'GUARD_EOF'
           # KMI / page-size guard, sourced by anykernel.sh right after ak3-core.sh.
@@ -2287,8 +1960,6 @@ jobs:
           fi
 
           KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
-          # a 16k zip flashed on a 4k phone (or the other way round) does not
-          # boot, so the odd one out says what it is
           PS_TAG=""
           [ "${{ inputs.page_size }}" = "16k" ] && PS_TAG="-16k"
           ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}${PS_TAG}-${{ matrix.root_variant }}-Mosey-AnyKernel3.zip"
@@ -2333,8 +2004,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p managers
-          # The in-kernel driver is already baked into the boot image; this
-          # just grabs the userspace manager app so it ships in one place.
           case "${{ matrix.root_variant }}" in
             FinaSU)        MGR_REPO="LyraVoid/FinaSU" ;;
             KernelSU-Next) MGR_REPO="KernelSU-Next/KernelSU-Next" ;;
@@ -2368,9 +2037,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p metamodule_out
-          # The kernel-side prep (tmpfs xattr/ACL, OverlayFS) is already baked
-          # into the image by the configure step; this just ships the matching
-          # userspace metamodule zip alongside it.
           case "${{ inputs.metamodule }}" in
             NoMount)        META_REPO="maxsteeel/nomount" ;;
             ZeroMount)      META_REPO="Enginex0/zeromount" ;;
@@ -2419,14 +2085,6 @@ jobs:
           if [ -z "$clang_bin" ] || [ ! -x "$clang_bin/clang" ]; then echo "::warning::Re-Kernel: no prebuilt clang, skipping"; exit 0; fi
           export PATH="$PWD/$clang_bin:$PATH"
           cp "$cfg" "$OBJ/.config"
-          # RUST: a C module never needs it and the runner has no matching rustc.
-          # TRIM_UNUSED_KSYMS: on (older) GKI like 6.1 the synced .config carries
-          # it, which makes modules_prepare regenerate autoksyms.h from an ABI
-          # whitelist (abi_symbollist.raw) that isn't in this standalone module
-          # tree -> "whitelist file not found" and the module is skipped. Trimming
-          # unused exports is a whole-kernel step that means nothing for one
-          # out-of-tree .ko (the real kernel was already built by Kleaf), so drop
-          # it here. 6.6/6.12 don't set it; disabling it there is a no-op.
           if [ -f common/scripts/config ]; then
             common/scripts/config --file "$OBJ/.config" --disable RUST --disable TRIM_UNUSED_KSYMS || true
           fi
