@@ -925,6 +925,7 @@ jobs:
             }
             apply_dsp_soft "$DSP/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" "ghost-task pid.c guard"
             apply_dsp_soft "$DSP/0001-Guard-USER_NS-for-non-root-users.patch" "USER_NS non-root guard"
+            apply_dsp_soft "$DSP/export_ipc_ns_for_rust_binder.patch" "export ipc_ns for rust binder (6.12 rust_binder.ko)"
 
             case "$KVER_SHORT" in
               6.12|6.13|6.14|6.15) KABI="$DSP/fix_sysvipc_kabi_a16-6.12.patch"; SLOTS="gendwarfksyms __kabi_ignored unions" ;;
