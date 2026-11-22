@@ -1512,7 +1512,11 @@ jobs:
             set_kconfig CONFIG_IP_SET_HASH_IP y
             set_kconfig CONFIG_IP_SET_HASH_NET y
             set_kconfig CONFIG_NETFILTER_XT_SET y
-            echo "[+] DroidSpaces: PID/UTS/NET/IPC/USER ns + SysV IPC + POSIX MQ + devtmpfs + overlay + netfilter/ipset (GKI-ABI-safe set)"
+            set_kconfig CONFIG_MACVLAN y
+            set_kconfig CONFIG_NF_NAT y
+            set_kconfig CONFIG_IP6_NF_NAT y
+            set_kconfig CONFIG_IP6_NF_TARGET_MASQUERADE y
+            echo "[+] DroidSpaces: PID/UTS/NET/IPC/USER ns + SysV IPC + POSIX MQ + devtmpfs + overlay + netfilter/ipset + macvlan/IPv6-NAT (GKI-ABI-safe set)"
           fi
 
           if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
