@@ -46,6 +46,19 @@ on:
           - standalone-matrix
           - wildkernels-fork-pipeline
         default: standalone-matrix
+      root_variant:
+        description: "Root solution to build in. FinaSU is the vendored default; the rest are cloned from upstream. NoRoot = GKI+SUSFS with no manager. 'All' builds FinaSU + the 5 KernelSU-family variants in parallel (NoRoot only when picked on its own)."
+        type: choice
+        options:
+          - FinaSU
+          - KernelSU-Next
+          - KernelSU
+          - SukiSU-Ultra
+          - BakaSU
+          - KowSU
+          - NoRoot
+          - All
+        default: FinaSU
       release_type:
         description: "Release Type"
         type: choice
@@ -72,10 +85,17 @@ on:
         description: "Mask the shell->su SELinux transition from app probes (CONFIG_SELINUX_HIDE_SHELL_SU_TRANS). Needs the hide_shell_su.c/.h patch in-tree - inert without it. Defeats checkSELinuxAccess-style root detectors; leave ON for a hardened daily driver."
         type: boolean
         default: true
-      enable_nomount:
-        description: "Enable NoMount / Mountify Metamodule Support + TMPFS xattr & POSIX ACLs"
-        type: boolean
-        default: true
+      metamodule:
+        description: "Mount metamodule to prep the kernel for. VFS engines (NoMount/ZeroMount) are kernel-side; OverlayFS engines (Mountify/Hybrid) also get CONFIG_OVERLAY_FS=y. Every engine but 'none' enables TMPFS xattr + POSIX ACLs. The module zip is fetched and uploaded as a side artifact; 'none' skips both."
+        type: choice
+        options:
+          - NoMount
+          - ZeroMount
+          - Mountify
+          - Hybrid
+          - Magic-Mount-rs
+          - none
+        default: NoMount
       security_patches:
         description: "Security patch level: monthly = latest tagged GKI/LTS (Google monthly, tested); latest-cve = also apply post-release stable CVE fixes on top (bleeding edge, may skip on conflict - READ THE README WARNING); none = base as pinned"
         type: choice
@@ -98,7 +118,7 @@ on:
         type: boolean
         default: true
       enable_droidspaces:
-        description: "Enable DroidSpaces-OSS Container Runtime Configs & Patches"
+        description: "DroidSpaces-OSS complete container/Docker set (namespaces + SysV IPC + kABI patch + netfilter, GKI-ABI-safe)"
         type: boolean
         default: true
       enable_performance:
@@ -173,6 +193,12 @@ jobs:
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
           req_kmi = "${{ inputs.kmi_generation }}".strip().lower() or "auto"
+          req_root = "${{ inputs.root_variant }}"
+          # 'All' = every manager, but not NoRoot (you ask for that one on its own)
+          if req_root == "All":
+              roots = ["FinaSU", "KernelSU-Next", "KernelSU", "SukiSU-Ultra", "BakaSU", "KowSU"]
+          else:
+              roots = [req_root]
 
           all_families = [
               {"kernel_version": "android14-6.1",  "kver": "6.1",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
@@ -352,8 +378,10 @@ jobs:
               else:
                   entry["lts_version"] = tip or f'{fam["kver"]}-LTS'
                   entry["follow_tip"] = "true"
-              entry["root_variant"] = "FinaSU"
-              include.append(entry)
+              for r in roots:
+                  e = dict(entry)
+                  e["root_variant"] = r
+                  include.append(e)
 
           matrix_json = json.dumps({"include": include})
           print("Generated matrix:", matrix_json)
@@ -642,26 +670,54 @@ jobs:
           fi
           git clone --depth=1 https://github.com/thelok1s/mosey-extended.git mosey_extended
 
-      - name: Integrate FinaSU
+      - name: Integrate Root Implementation (${{ matrix.root_variant }})
         shell: bash
         run: |
           cd kernel_workspace
           DRIVERS_DIR="common/drivers"
           rm -rf "$DRIVERS_DIR/kernelsu"
 
-          ROOT_REPO="https://github.com/LyraVoid/FinaSU.git"
-          ROOT_DIR="FinaSU"
+          VARIANT="${{ matrix.root_variant }}"
+          if [ "$VARIANT" = "NoRoot" ]; then
+            echo "[i] NoRoot: GKI + SUSFS with no KernelSU driver (CONFIG_KSU stays off)"
+            exit 0
+          fi
 
-          echo "[+] Cloning FinaSU from ${ROOT_REPO}..."
+          # Where each manager's kernel tree comes from. FinaSU is vendored-style
+          # (full clone + a pinned commit, because its Kbuild reads KSU_VERSION
+          # from git history and its headers symlink into the repo root); the
+          # rest are a shallow clone of the branch that carries drivers/kernelsu.
+          ROOT_BRANCH=""
+          case "$VARIANT" in
+            FinaSU)        ROOT_REPO="https://github.com/LyraVoid/FinaSU.git";            ROOT_DIR="FinaSU" ;;
+            BakaSU)        ROOT_REPO="https://github.com/Baka-SU/BakaSU.git";             ROOT_DIR="BakaSU" ;;
+            KernelSU)      ROOT_REPO="https://github.com/tiann/KernelSU.git";             ROOT_DIR="KernelSU";      ROOT_BRANCH="main" ;;
+            SukiSU-Ultra)  ROOT_REPO="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git";  ROOT_DIR="SukiSU-Ultra";  ROOT_BRANCH="main" ;;
+            KowSU)         ROOT_REPO="https://github.com/KOWX712/KernelSU.git";           ROOT_DIR="KowSU";         ROOT_BRANCH="master" ;;
+            KernelSU-Next)
+              # the susfs-aware fork when SUSFS is on, else upstream next
+              if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+                ROOT_REPO="https://github.com/pershoot/KernelSU-Next.git";  ROOT_DIR="KernelSU-Next"; ROOT_BRANCH="dev-susfs"
+              else
+                ROOT_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"; ROOT_DIR="KernelSU-Next"; ROOT_BRANCH="next"
+              fi ;;
+            *) echo "::error::unknown root_variant '$VARIANT'"; exit 1 ;;
+          esac
+
+          echo "[+] Cloning ${ROOT_DIR} from ${ROOT_REPO}..."
           rm -rf "$ROOT_DIR"
-          # FinaSU needs a real full-depth checkout: kernel/include/uapi symlinks
-          # into the repo root and Kbuild derives KSU_VERSION from git history.
-          FINASU_PIN="2d5786b9129a254a87ac358c8bec0203ccd53351"
-          git clone "$ROOT_REPO" "$ROOT_DIR"
-          if git -C "$ROOT_DIR" checkout -q "$FINASU_PIN" 2>/dev/null; then
-            echo "[+] FinaSU pinned to ${FINASU_PIN:0:10}"
+          if [ "$VARIANT" = "FinaSU" ]; then
+            FINASU_PIN="2d5786b9129a254a87ac358c8bec0203ccd53351"
+            git clone "$ROOT_REPO" "$ROOT_DIR"
+            if git -C "$ROOT_DIR" checkout -q "$FINASU_PIN" 2>/dev/null; then
+              echo "[+] FinaSU pinned to ${FINASU_PIN:0:10}"
+            else
+              echo "::warning::could not pin FinaSU to ${FINASU_PIN:0:10}; building branch tip"
+            fi
+          elif [ -n "$ROOT_BRANCH" ]; then
+            git clone --depth=1 -b "$ROOT_BRANCH" "$ROOT_REPO" "$ROOT_DIR" || git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
           else
-            echo "::warning::could not pin FinaSU to ${FINASU_PIN:0:10}; building branch tip"
+            git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
           fi
 
           if [ ! -d "$ROOT_DIR/kernel" ]; then
@@ -680,10 +736,11 @@ jobs:
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
           fi
 
-          # Bake the current FinaSU manager's signing cert as the auto-trusted
+          # FinaSU only: bake its manager's signing cert as the auto-trusted
           # slot (else the manager shows "Not installed"). Computed from the
-          # latest manager APK, with a known v1.4.x fallback.
-          if [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
+          # latest manager APK, with a known v1.4.x fallback. The other managers
+          # trust their app at runtime, so there is nothing to bake for them.
+          if [ "$VARIANT" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
             FINA_SZ="0x02cc"
             FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
             FMGR="$(ls "$GITHUB_WORKSPACE"/managers/*.apk 2>/dev/null | head -1 || true)"
@@ -1006,10 +1063,68 @@ jobs:
             find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
           fi
 
-          # 5. DroidSpaces-OSS
+          # 5. DroidSpaces-OSS - complete GKI container / Docker kernel patch set.
+          #    The vendored files don't carry "droidspaces" in their names, so the
+          #    old "*droidspaces*.patch" glob matched nothing and silently applied
+          #    zero of them. Name each file we actually want instead. Three patches,
+          #    all under the one DroidSpaces switch:
+          #      - ghost-task (pid.c): KMI-neutral runtime guard the PID-ns path
+          #        leans on (stops a null-task deref).
+          #      - USER_NS guard (user_namespace.c): the doc's fix for Docker's
+          #        "unsafe /proc" refusal once CONFIG_USER_NS is on - it blocks
+          #        unprivileged userns creation for non-root, the exact surface
+          #        Android disables USER_NS over. KMI-neutral.
+          #      - SysV IPC kABI relocation: per KMI generation, see below.
+          #    The 5.10-and-below posix_mqueue padding patch is NOT used: on 6.x
+          #    POSIX_MQUEUE touches no KMI field. @Dev_DcS
           if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
-            echo "[+] Applying DroidSpaces-OSS patches..."
-            find "$PATCH_DIR" -name "*droidspaces*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+            echo "[+] Applying DroidSpaces-OSS kernel patches..."
+            DSP="$PATCH_DIR/common/droidspaces"
+
+            # dry-run gated, warn-on-miss: these are fixups, not boot-critical, so
+            # a layout drift downgrades to a warning instead of failing the build.
+            apply_dsp_soft() {
+              f="$1"; label="$2"
+              if [ ! -f "$f" ]; then echo "::warning::DroidSpaces: $label patch not found ($f)"; return; fi
+              if patch -p1 -N -s --dry-run -i "$f" >/dev/null 2>&1; then
+                patch -p1 -N -s --no-backup-if-mismatch -i "$f"; echo "  [ok]   $label"
+              else
+                echo "::warning::DroidSpaces: $label did not apply on ${{ matrix.kernel_version }}; skipped"
+              fi
+            }
+            apply_dsp_soft "$DSP/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" "ghost-task pid.c guard"
+            apply_dsp_soft "$DSP/0001-Guard-USER_NS-for-non-root-users.patch" "USER_NS non-root guard"
+
+            # SysV IPC kABI relocation - MANDATORY with CONFIG_SYSVIPC (set in the
+            # config step). CONFIG_SYSVIPC adds task_struct.sysvsem (8B) + sysvshm
+            # (16B); left inline they shift every later field and shatter the
+            # vendor-module KMI -> instant bootloop. The patch moves both into
+            # reserved ANDROID_KABI padding so the symbol CRC and every field
+            # offset stay byte-identical to stock. The DroidSpaces doc splits the
+            # relocation by KMI generation, so pick per family:
+            #   6.1 / 6.6 (KMI < 6.12): fix_sysvipc_kabi_6_7_8.patch - packs into
+            #       the free reserved slots 6/7/8 (verified free: 6.1 uses 1-3,
+            #       6.6 uses 1-2). Proven CRC-identical under genksyms + compiles.
+            #   6.12+:                  fix_sysvipc_kabi_a16-6.12.patch - the doc's
+            #       6.12 variant (gendwarfksyms __kabi_ignored unions). Compiles.
+            # STRICT: if the chosen patch does not apply we abort - shipping
+            # CONFIG_SYSVIPC without its relocation is an instant bootloop, and a
+            # reject usually means a reserved slot stopped being free, which is
+            # exactly when we must stop. @Dev_DcS
+            case "$KVER_SHORT" in
+              6.12|6.13|6.14|6.15) KABI="$DSP/fix_sysvipc_kabi_a16-6.12.patch"; SLOTS="gendwarfksyms __kabi_ignored unions" ;;
+              *)                   KABI="$DSP/fix_sysvipc_kabi_6_7_8.patch";    SLOTS="ANDROID_KABI reserved slots 6/7/8" ;;
+            esac
+            echo "[+] SysV IPC: relocating sysvsem/sysvshm ($SLOTS) for ${KVER_SHORT}..."
+            if [ ! -f "$KABI" ]; then
+              echo "::error::DroidSpaces: SysV IPC kABI patch missing ($KABI)"; exit 1
+            fi
+            if ! patch -p1 -N --fuzz=3 --dry-run -i "$KABI" >/dev/null 2>&1; then
+              echo "::error::DroidSpaces: $(basename "$KABI") does not apply on ${{ matrix.kernel_version }} - refusing to enable CONFIG_SYSVIPC without the kABI relocation (would bootloop). Check the ANDROID_KABI reserved slots are still free in task_struct."
+              exit 1
+            fi
+            patch -p1 -N --fuzz=3 --no-backup-if-mismatch -i "$KABI"
+            echo "  [ok]   SysV IPC kABI relocation applied (task_struct CRC unchanged)"
           fi
 
           # 6. Performance tuning patches.
@@ -1587,9 +1702,65 @@ jobs:
             set_kconfig CONFIG_SELINUX_HIDE_SHELL_SU_TRANS y
           fi
 
-          if [ "${{ inputs.enable_nomount }}" = "true" ]; then
+          # Metamodule prep. Every engine but 'none' wants tmpfs xattr + POSIX
+          # ACLs; the OverlayFS engines (Mountify, Hybrid) also want
+          # CONFIG_OVERLAY_FS=y. The VFS engines (NoMount, ZeroMount) are
+          # kernel-side but their drivers ride in with the WildKernels/SUSFS
+          # patches - here we just guarantee the configs they all lean on.
+          if [ "${{ inputs.metamodule }}" != "none" ]; then
             set_kconfig CONFIG_TMPFS_XATTR y
             set_kconfig CONFIG_TMPFS_POSIX_ACL y
+            case "${{ inputs.metamodule }}" in
+              Mountify|Hybrid) set_kconfig CONFIG_OVERLAY_FS y ;;
+            esac
+          fi
+
+          # DroidSpaces / containers - the complete GKI-ABI-safe container set
+          # (from DroidSpaces-OSS Kernel-Configuration.md). Android ships
+          # NAMESPACES=y but turns PID_NS off (and IPC_NS with it), so a container
+          # manager reports "PID/IPC namespace not supported" and won't start. The
+          # heavy stack Docker needs - VETH, BRIDGE, NETFILTER, NF_CONNTRACK,
+          # NF_NAT, MASQUERADE, cgroups, MEMCG, OVERLAY_FS - is already =y in
+          # gki_defconfig on all three families, so we add only what is genuinely
+          # off, and only options the doc certifies GKI-ABI-safe. We deliberately
+          # do NOT touch CGROUP_DEVICE / CGROUP_PIDS: enabling a cgroup controller
+          # bumps CGROUP_SUBSYS_COUNT, which resizes css_set.subsys[] - a KMI
+          # struct - and breaks vendor modules. That ABI cost is exactly why
+          # DroidSpaces leaves them off on GKI, and containers still run. @Dev_DcS
+          if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
+            # Namespaces. UTS_NS/NET_NS already ride in on NAMESPACES=y; we pin
+            # them so a defconfig change can't silently drop them underneath us.
+            set_kconfig CONFIG_PID_NS y        # off in gki_defconfig; fatal if missing
+            set_kconfig CONFIG_UTS_NS y
+            set_kconfig CONFIG_NET_NS y
+            set_kconfig CONFIG_IPC_NS y        # fatal if missing
+            set_kconfig CONFIG_USER_NS y       # doc: clears Docker's unsafe-/proc refusal; the USER_NS patch guards it for non-root
+            # IPC. SYSVIPC is the one option that reaches into task_struct; its
+            # kABI relocation patch is applied and STRICTLY gated in the patch
+            # step, which aborts the whole job if the relocation didn't land - so
+            # CONFIG_SYSVIPC never ships without it. It pulls SYSVIPC_SYSCTL/
+            # _COMPAT in on its own. The post-build KMI check is the backstop; the
+            # task_struct CRC reads byte-identical to stock after relocation.
+            set_kconfig CONFIG_SYSVIPC y
+            set_kconfig CONFIG_POSIX_MQUEUE y
+            # Device nodes + overlay (volatile mode) + tmpfs attrs.
+            set_kconfig CONFIG_DEVTMPFS y      # DroidSpaces sets up /dev
+            set_kconfig CONFIG_OVERLAY_FS y    # volatile mode
+            set_kconfig CONFIG_TMPFS_POSIX_ACL y
+            set_kconfig CONFIG_TMPFS_XATTR y
+            # Netfilter / ipset extras the doc lists as GKI-safe - self-contained
+            # xt_*/ip_set modules that add no field to sk_buff or task_struct.
+            # addrtype is required for container NAT; the rest back UFW / Fail2ban
+            # firewalling inside NAT-mode containers.
+            set_kconfig CONFIG_NETFILTER_XT_MATCH_ADDRTYPE y
+            set_kconfig CONFIG_NETFILTER_XT_TARGET_REJECT y
+            set_kconfig CONFIG_NETFILTER_XT_TARGET_LOG y
+            set_kconfig CONFIG_NETFILTER_XT_MATCH_RECENT y
+            set_kconfig CONFIG_IP_SET y
+            set_kconfig CONFIG_IP_SET_HASH_IP y
+            set_kconfig CONFIG_IP_SET_HASH_NET y
+            set_kconfig CONFIG_NETFILTER_XT_SET y
+            echo "[+] DroidSpaces: PID/UTS/NET/IPC/USER ns + SysV IPC + POSIX MQ + devtmpfs + overlay + netfilter/ipset (GKI-ABI-safe set)"
           fi
 
           if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
@@ -2120,7 +2291,7 @@ jobs:
           # boot, so the odd one out says what it is
           PS_TAG=""
           [ "${{ inputs.page_size }}" = "16k" ] && PS_TAG="-16k"
-          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}${PS_TAG}-FinaSU-Mosey-AnyKernel3.zip"
+          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}${PS_TAG}-${{ matrix.root_variant }}-Mosey-AnyKernel3.zip"
           (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .)
 
           cat << EOF > BuildInfo.txt
@@ -2130,8 +2301,8 @@ jobs:
           KMI: ${KMI_TAG} (flash only on a phone whose stock uname -r shows the same)
           Manifest Branch: ${{ matrix.manifest_branch }}
           SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
-          Root Implementation: FinaSU
-          NoMount / TMPFS ACL: ${{ inputs.enable_nomount }}
+          Root Implementation: ${{ matrix.root_variant }}
+          Metamodule: ${{ inputs.metamodule }}
           Partition Guards: bbg+nv (always on)
           Networking Suite: ${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}
           Extended BPF/BTF: ${{ inputs.enable_bpf }}
@@ -2164,7 +2335,19 @@ jobs:
           mkdir -p managers
           # The in-kernel driver is already baked into the boot image; this
           # just grabs the userspace manager app so it ships in one place.
-          MGR_REPO="LyraVoid/FinaSU"
+          case "${{ matrix.root_variant }}" in
+            FinaSU)        MGR_REPO="LyraVoid/FinaSU" ;;
+            KernelSU-Next) MGR_REPO="KernelSU-Next/KernelSU-Next" ;;
+            KernelSU)      MGR_REPO="tiann/KernelSU" ;;
+            SukiSU-Ultra)  MGR_REPO="SukiSU-Ultra/SukiSU-Ultra" ;;
+            BakaSU)        MGR_REPO="Baka-SU/BakaSU" ;;
+            KowSU)         MGR_REPO="KOWX712/KernelSU" ;;
+            *)             MGR_REPO="" ;;
+          esac
+          if [ -z "$MGR_REPO" ]; then
+            echo "[i] ${{ matrix.root_variant }}: no manager app to fetch"
+            exit 0
+          fi
           echo "[+] Fetching manager APK from $MGR_REPO (latest release)..."
           if gh release download --repo "$MGR_REPO" --pattern '*.apk' --dir managers 2>/dev/null; then
             echo "[+] manager APK(s): $(ls managers 2>/dev/null | tr '\n' ' ')"
@@ -2179,26 +2362,37 @@ jobs:
           name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Manager"
           path: managers/*.apk
 
-      - name: Fetch NoMount module
-        if: ${{ true }}
+      - name: Fetch metamodule (${{ inputs.metamodule }})
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p nomount_out
-          echo "[+] Fetching NoMount module (maxsteeel/nomount, latest release)..."
-          if gh release download --repo maxsteeel/nomount --pattern '*.zip' --dir nomount_out 2>/dev/null; then
-            echo "[+] NoMount module(s): $(ls nomount_out 2>/dev/null | tr '\n' ' ')"
+          mkdir -p metamodule_out
+          # The kernel-side prep (tmpfs xattr/ACL, OverlayFS) is already baked
+          # into the image by the configure step; this just ships the matching
+          # userspace metamodule zip alongside it.
+          case "${{ inputs.metamodule }}" in
+            NoMount)        META_REPO="maxsteeel/nomount" ;;
+            ZeroMount)      META_REPO="Enginex0/zeromount" ;;
+            Mountify)       META_REPO="backslashxx/mountify" ;;
+            Hybrid)         META_REPO="Hybrid-Mount/meta-hybrid_mount" ;;
+            Magic-Mount-rs) META_REPO="Tools-cx-app/meta-magic_mount-rs" ;;
+            *)              META_REPO="" ;;
+          esac
+          [ -z "$META_REPO" ] && { echo "[i] no metamodule to fetch"; exit 0; }
+          echo "[+] Fetching ${{ inputs.metamodule }} module ($META_REPO, latest release)..."
+          if gh release download --repo "$META_REPO" --pattern '*.zip' --dir metamodule_out 2>/dev/null; then
+            echo "[+] metamodule zip(s): $(ls metamodule_out 2>/dev/null | tr '\n' ' ')"
           else
-            echo "::warning::could not fetch the NoMount module (no zip asset or repo unavailable); install it by hand"
+            echo "::warning::could not fetch $META_REPO (no zip asset or repo unavailable); install the metamodule by hand"
           fi
 
-      - name: Upload NoMount module
-        if: ${{ hashFiles('nomount_out/*') != '' }}
+      - name: Upload metamodule
+        if: ${{ hashFiles('metamodule_out/*') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-NoMount"
-          path: nomount_out/*
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-${{ inputs.metamodule }}"
+          path: metamodule_out/*
 
       - name: Build Re-Kernel module (out-of-tree, experimental, @Dev_DcS)
         if: ${{ inputs.enable_rekernel == 'true' }}
