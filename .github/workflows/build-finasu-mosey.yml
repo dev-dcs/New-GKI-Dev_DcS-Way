@@ -1799,6 +1799,9 @@ jobs:
             cp -a "$ENABLER/." "$PKG/"
             rm -f "$PKG/NOTICE-wonder.md"
             MODNAME="Mosey-enabler"
+            for a in system_ext/priv-app/MoseyBridgeShim/MoseyBridgeShim.apk payload/MoseyBridgeShim.apk; do
+              [ -s "$PKG/$a" ] || echo "::warning::Mosey enabler: $a is not in the repo checkout, so it won't be in the zip and customize.sh will flag it missing on-device. Commit the APK under mosey/enabler/ (it isn't .gitignored, but binaries have to be pushed)."
+            done
           else
             echo "[+] No mosey/enabler in repo; shipping the minimal wonder loader module"
             mkdir -p "$PKG/META-INF/com/google/android"

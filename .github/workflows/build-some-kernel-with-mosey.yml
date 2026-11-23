@@ -1,6 +1,5 @@
 name: Build KernelSU and fork for Pixel (WildKernels + SUSFS + Mosey + Integrity)
-# what was asked for, readable straight from the runs list - a 6.6 run and a
-# 6.12 run used to look the same there
+
 run-name: "${{ inputs.kernel_build_version }} | ${{ inputs.gki_lts_version }} | KMI ${{ inputs.kmi_generation }} | ${{ inputs.page_size }} | FinaSU + Mosey"
 
 permissions:
@@ -19,7 +18,7 @@ on:
           - android15-6.6
           - android14-6.1
           - all
-        default: android16-6.12
+        default: all
       gki_lts_version:
         description: "Sublevel: 'LTS' (tip of the branch picked for the family) or the last digits of an older one, e.g. 150"
         type: string
@@ -58,7 +57,7 @@ on:
           - KowSU
           - NoRoot
           - All
-        default: FinaSU
+        default: All
       release_type:
         description: "Release Type"
         type: choice
