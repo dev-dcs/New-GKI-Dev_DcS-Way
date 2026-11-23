@@ -117,6 +117,10 @@ on:
         description: "DroidSpaces-OSS complete container/Docker set (namespaces + SysV IPC + kABI patch + netfilter, GKI-ABI-safe)"
         type: boolean
         default: true
+      enable_cgroup_limits:
+        description: "Container CPU + process limits (--cpus/--pids-limit; CFS_BANDWIDTH + CGROUP_PIDS - shifts GKI ABI, the KMI check gates it, boot-test)"
+        type: boolean
+        default: false
       enable_performance:
         description: "Enable WildKernels Performance Tuning & Compression Patches (LZ4/ZSTD)"
         type: boolean
@@ -1517,6 +1521,14 @@ jobs:
             set_kconfig CONFIG_IP6_NF_NAT y
             set_kconfig CONFIG_IP6_NF_TARGET_MASQUERADE y
             echo "[+] DroidSpaces: PID/UTS/NET/IPC/USER ns + SysV IPC + POSIX MQ + devtmpfs + overlay + netfilter/ipset + macvlan/IPv6-NAT (GKI-ABI-safe set)"
+          fi
+
+          if [ "${{ inputs.enable_cgroup_limits }}" = "true" ]; then
+            set_kconfig CONFIG_CGROUP_SCHED y
+            set_kconfig CONFIG_FAIR_GROUP_SCHED y
+            set_kconfig CONFIG_CFS_BANDWIDTH y
+            set_kconfig CONFIG_CGROUP_PIDS y
+            echo "[!] Container CPU/pids limits: CFS_BANDWIDTH + CGROUP_PIDS ON - these shift GKI ABI structs; the post-build KMI check will fail the build if a Pixel-list symbol CRC moves, and a boot test is required for the rest"
           fi
 
           if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
