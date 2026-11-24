@@ -1790,11 +1790,11 @@ jobs:
           PY
           if [ "$rc" -eq 3 ]; then
             MSG="symbols the Pixel drivers import do not match Google's $REF build (list above); modules using them will not load"
-            if [ "${{ matrix.kmi_ref_exact }}" = "true" ] && [ "${{ inputs.allow_version_mismatch }}" != "true" ]; then
-              echo "::error::KMI broken: $MSG. Something in this build changed the ABI - not packaging a kernel that would loop at boot."
+            if [ "${{ matrix.kmi_ref_exact }}" = "true" ]; then
+              echo "::error::KMI broken: $MSG. The ABI changed against the exact Google build - not packaging a kernel that would loop at boot. allow_version_mismatch does NOT override a real CRC break; drop whatever moved the ABI (CFS_BANDWIDTH/CGROUP_PIDS via enable_cgroup_limits are the usual cause)."
               exit 1
             fi
-            echo "::warning::KMI differs: $MSG."
+            echo "::warning::KMI differs: $MSG. Tip build against a near reference, so it may be version noise - boot-test before trusting it."
           elif [ "$rc" -ne 0 ]; then
             echo "::warning::KMI comparison did not run to the end (rc=$rc)"
           fi
