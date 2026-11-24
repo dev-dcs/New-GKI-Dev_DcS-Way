@@ -14,29 +14,28 @@ behaviour is unchanged until you name a socket. Finding the name is a one-liner
 on-device: cat /proc/net/unix | grep '@'.
 
 Everything is file-scope static plus a late_initcall register_sysctl(); the
-hook is one early return in unix_seq_show(). No exported symbol, no struct a
-vendor module can see - the GKI KMI is untouched.
+hook is one early return in unix_seq_show(), inside the existing CONFIG_PROC_FS
+block. No exported symbol, no struct a vendor module can see - the GKI KMI is
+untouched.
 
 Signed-off-by: @Dev_DcS
 ---
-diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
-index 1c2b3d4..2d3e4f5 100644
 --- a/net/unix/af_unix.c
 +++ b/net/unix/af_unix.c
-@@ -115,6 +115,8 @@
+@@ -116,6 +116,9 @@
  #include <linux/freezer.h>
  #include <linux/file.h>
  #include <linux/btf_ids.h>
 +#include <linux/capability.h>
 +#include <linux/sysctl.h>
-
- #include "scm.h"
-
-@@ -3360,6 +3362,78 @@ static const struct seq_operations unix_seq_ops = {
- 	.show   = unix_seq_show,
- };
-
-+#ifdef CONFIG_PROC_FS
++#include <linux/version.h>
+ 
+ static atomic_long_t unix_nr_socks;
+ static struct hlist_head bsd_socket_buckets[UNIX_HASH_SIZE / 2];
+@@ -3380,6 +3383,92 @@
+ 		spin_unlock(&seq_file_net(seq)->unx.table.locks[sk->sk_hash]);
+ }
+ 
 +static int hide_manager_socket __read_mostly;
 +static char hidden_socket_name[128];
 +
@@ -63,18 +62,19 @@ index 1c2b3d4..2d3e4f5 100644
 +
 +	nlen = addr->len - offsetof(struct sockaddr_un, sun_path);
 +	if (nlen <= 1 || addr->name->sun_path[0] != '\0')
-+		return false;		/* only abstract sockets carry a leak */
++		return false;
 +
 +	name = addr->name->sun_path + 1;
 +	nlen -= 1;
 +
-+	for (p = hidden_socket_name; *p; p = (*end == ',') ? end + 1 : end) {
++	for (p = hidden_socket_name; *p; ) {
 +		size_t mlen;
 +
 +		end = strchrnul(p, ',');
 +		mlen = end - p;
 +		if (mlen && mlen == (size_t)nlen && !memcmp(p, name, mlen))
 +			return true;
++		p = (*end == ',') ? end + 1 : end;
 +	}
 +	return false;
 +}
@@ -121,20 +121,18 @@ index 1c2b3d4..2d3e4f5 100644
 +	return 0;
 +}
 +late_initcall(devdcs_sock_sysctl_init);
-+#else
-+static inline bool devdcs_unix_hidden(const struct unix_sock *u) { return false; }
-+#endif /* CONFIG_PROC_FS */
 +
  static int unix_seq_show(struct seq_file *seq, void *v)
  {
- 	if (v == SEQ_START_TOKEN)
-@@ -3369,6 +3443,9 @@ static int unix_seq_show(struct seq_file *seq, void *v)
+ 
+@@ -3389,6 +3478,10 @@
+ 	else {
  		struct sock *s = v;
  		struct unix_sock *u = unix_sk(s);
-
++
 +		if (devdcs_unix_hidden(u))
 +			return 0;
 +
  		unix_state_lock(s);
-
+ 
  		seq_printf(seq, "%pK: %08X %08X %08X %04X %02X %5lu",
