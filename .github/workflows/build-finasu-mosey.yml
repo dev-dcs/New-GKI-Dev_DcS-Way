@@ -77,10 +77,6 @@ on:
         description: "Enable SUSFS (FinaSU integrates it natively; leave ON for integrity hiding)"
         type: boolean
         default: true
-      hide_shell_su:
-        description: "Mask the shell->su SELinux transition from app probes (CONFIG_SELINUX_HIDE_SHELL_SU_TRANS). Needs the hide_shell_su.c/.h patch in-tree - inert without it. Defeats checkSELinuxAccess-style root detectors; leave ON for a hardened daily driver."
-        type: boolean
-        default: true
       metamodule:
         description: "Mount metamodule to prep the kernel for. VFS engines (NoMount/ZeroMount) are kernel-side; OverlayFS engines (Mountify/Hybrid) also get CONFIG_OVERLAY_FS=y. Every engine but 'none' enables TMPFS xattr + POSIX ACLs. The module zip is fetched and uploaded as a side artifact; 'none' skips both."
         type: choice
@@ -100,15 +96,6 @@ on:
           - latest-cve
           - none
         default: monthly
-      net_features:
-        description: "Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB on 6.1/6.6) + NTSync (/dev/ntsync). 'both' (default), 'networking' or 'ntsync' for one, 'none' for neither."
-        type: choice
-        options:
-          - both
-          - networking
-          - ntsync
-          - none
-        default: both
       enable_bpf:
         description: "Enable Extended BPF (BTF, eBPF, FUSE-BPF)"
         type: boolean
@@ -1019,7 +1006,7 @@ jobs:
               ;;
           esac
 
-          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ]; then
+          if [ "true" = "true" ]; then
             echo "[+] Applying NTSync for ${{ matrix.kernel_version }}..."
             NT="$PATCH_DIR/common/ntsync"
             if [ "${{ matrix.kernel_version }}" = "android16-6.12" ]; then
@@ -1030,7 +1017,7 @@ jobs:
             if [ -f "$NT/ntsync_base.patch" ]; then patch -p1 --forward --fuzz=3 < "$NT/ntsync_base.patch" || true; else echo "::warning::NTSync: ntsync_base.patch not found"; fi
           fi
 
-          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
+          if [ "true" = "true" ]; then
             echo "[+] Applying Networking patches for ${KVER_SHORT}..."
             find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
           fi
@@ -1522,7 +1509,6 @@ jobs:
           WONDER_EOF
 
       - name: Apply shell->su SELinux hide patch (@Dev_DcS)
-        if: ${{ inputs.hide_shell_su == true }}
         shell: bash
         run: |
           APPLY="$GITHUB_WORKSPACE/Construction_Site/KernelStuff/selinux_hide_shell_su/apply.sh"
@@ -1605,7 +1591,7 @@ jobs:
             set_kconfig CONFIG_KSU_HOOK_TRACEPOINT n
           fi
 
-          if [ "${{ inputs.hide_shell_su }}" = "true" ]; then
+          if [ "true" = "true" ]; then
             set_kconfig CONFIG_SELINUX_HIDE_SHELL_SU_TRANS y
           fi
 
@@ -1652,7 +1638,7 @@ jobs:
             echo "[!] Container CPU/pids limits: CFS_BANDWIDTH + CGROUP_PIDS ON - these shift GKI ABI structs; the post-build KMI check will fail the build if a Pixel-list symbol CRC moves, and a boot test is required for the rest"
           fi
 
-          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}" = "true" ]; then
+          if [ "true" = "true" ]; then
             set_kconfig CONFIG_WIREGUARD y
             set_kconfig CONFIG_TCP_CONG_ADVANCED y
             set_kconfig CONFIG_TCP_CONG_BBR y
@@ -1679,7 +1665,7 @@ jobs:
             set_kconfig CONFIG_DEBUG_INFO_BTF y
           fi
 
-          if [ "${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
+          if [ "true" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
             set_kconfig CONFIG_NTSYNC y
           fi
 
@@ -2121,9 +2107,9 @@ jobs:
           Root Implementation: ${{ matrix.root_variant }}
           Metamodule: ${{ inputs.metamodule }}
           Partition Guards: bbg+nv (always on)
-          Networking Suite: ${{ (inputs.net_features == 'both' || inputs.net_features == 'networking') && 'true' || 'false' }}
+          Networking Suite: true
           Extended BPF/BTF: ${{ inputs.enable_bpf }}
-          NTSync (/dev/ntsync): ${{ (inputs.net_features == 'both' || inputs.net_features == 'ntsync') && 'true' || 'false' }}
+          NTSync (/dev/ntsync): true
           DroidSpaces-OSS: ${{ inputs.enable_droidspaces }}
           Mosey Extended Mode: ${{ inputs.mosey_mode }} (MAC: ${{ inputs.mosey_mac_addr }})
           NLMON Capture: ${{ inputs.enable_nlmon }}
