@@ -1,0 +1,26 @@
+Third-party components in this module
+=====================================
+
+Mosey bridge shim
+  Files:   system_ext/priv-app/MoseyBridgeShim/MoseyBridgeShim.apk
+           payload/MoseyBridgeShim.apk
+  Package: dev.bluehouse.moseybridgeshim
+  Author:  feelliao - the userspace side of the Mosey enabler
+  License: GNU General Public License v2
+  Source:  https://github.com/thelok1s/mosey-extended  (GPLv2 lineage of this
+           enabler; replace with feelliao's own repo/release if you obtained the
+           shim elsewhere). The corresponding source is available there.
+  These APKs are not stored in this repository. They are fetched at build time
+  (tools/fetch-blobs.sh + mosey/enabler/blobs.manifest) and this notice, together
+  with the GPLv2 terms at the source above, accompanies every binary copy of the
+  module - which is what GPLv2 asks for when you ship the compiled form.
+
+Not included here
+  MoseyApp.apk (com.google.android.mosey) is Google's proprietary application.
+  This project does not redistribute it. At install time the module uses the
+  copy already on the device; it is never fetched into, or shipped in, the zip.
+
+Radio firmware (bdwlan*, WCNSS_qcom_cfg.ini, LOWI) is Qualcomm's and is inert on
+Pixel (Broadcom) hardware.
+
+Variant and kernel glue: @Dev_DcS.

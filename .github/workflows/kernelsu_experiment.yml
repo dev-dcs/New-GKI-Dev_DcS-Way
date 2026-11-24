@@ -1,0 +1,1688 @@
+name: Build KernelSU Family [EXPERIMENT forks] (6.1 / 6.6 / 6.12) + Mosey Extended
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_build_version:
+        description: "Kernel Version Family (select 'all' to build 6.1 / 6.6 / 6.12 in parallel)"
+        type: choice
+        options:
+          - android15-6.6
+          - android14-6.1
+          - android16-6.12
+          - all
+        default: android15-6.6
+      gki_lts_version:
+        description: "Sublevel: 'All' builds every released sublevel on the family's KMI generation, 'LTS' just the branch tip, or the last digits of a specific one (e.g. 150)"
+        type: string
+        default: "All"
+      kernel_name:
+        description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
+        type: string
+        default: ""
+      page_size:
+        description: "ARM64 Memory Page Size (4k standard, 16k for supported 6.6/6.12 targets)"
+        type: choice
+        options:
+          - 4k
+          - 16k
+        default: 4k
+      build_variant:
+        description: "Pipeline Mode (standalone multi-version matrix or hook into WildKernels fork actions)"
+        type: choice
+        options:
+          - standalone-matrix
+          - wildkernels-fork-pipeline
+        default: standalone-matrix
+      root_variant:
+        description: "KernelSU-family EXPERIMENT forks (bleeding / less-tested - deliberately kept out of the main pipeline). 'All' builds them in parallel. Repos are best-guess; override a branch in the integration step if a fork moved."
+        type: choice
+        options:
+          - RKSU
+          - xxksu
+          - HyperSU
+          - NoRoot
+          - All
+        default: RKSU
+      release_type:
+        description: "Release Type"
+        type: choice
+        options:
+          - CI
+          - Pre-Release
+          - Release
+        default: CI
+      use_cache:
+        description: "Use Bazel/ccache build cache (restore/save)"
+        type: boolean
+        default: true
+      allow_version_mismatch:
+        description: "Module Check Bypass (force check_version() to pass on mismatched module CRCs)"
+        type: boolean
+        default: false
+
+      enable_susfs:
+        description: "Enable SUSFS for KernelSU (auto-selects per-kernel gki-android*-* branch + Ptrace/Unicode fixes)"
+        type: boolean
+        default: true
+      metamodule:
+        description: "Metamodule engine to prep the kernel for. VFS engines (NoMount/ZeroMount) are kernel-side; OverlayFS/Magic engines (Mountify/Hybrid/Magic-Mount-rs) are userspace - any kernel runs them. TMPFS xattr + POSIX ACLs go on for all but 'none'."
+        type: choice
+        options:
+          - NoMount
+          - ZeroMount
+          - Mountify
+          - Hybrid
+          - Magic-Mount-rs
+          - none
+        default: NoMount
+      ship_metamodule:
+        description: "Also fetch + attach the selected metamodule's release zip so its version matches the kernel (avoids a driver/module mismatch)"
+        type: boolean
+        default: false
+      enable_bbg:
+        description: "Enable Baseband Guard (BBG) LSM Partition Protection"
+        type: boolean
+        default: true
+      nv_write_guard:
+        description: "NV write guard: block writes to the modem's irreplaceable nv_protected.bin (RF-cal/IMEI). OFF by default - see README before enabling."
+        type: boolean
+        default: false
+      security_patches:
+        description: "Security patch level: monthly = latest tagged GKI/LTS (Google monthly, tested); latest-cve = also apply post-release stable CVE fixes on top (bleeding edge, may skip on conflict - READ THE README WARNING); none = base as pinned"
+        type: choice
+        options:
+          - monthly
+          - latest-cve
+          - none
+        default: monthly
+      enable_networking:
+        description: "Enable Advanced Networking (WireGuard, BBRv3/BBR, IPSet, TTL/HL Target, CAKE, CIFS/SMB)"
+        type: boolean
+        default: true
+      enable_bpf:
+        description: "Enable Extended BPF (BTF, eBPF, FUSE-BPF)"
+        type: boolean
+        default: true
+      enable_ntsync:
+        description: "Enable NTSync (/dev/ntsync Windows NT synchronization primitive driver)"
+        type: boolean
+        default: true
+      enable_droidspaces:
+        description: "Enable DroidSpaces-OSS Container Runtime Configs & Patches"
+        type: boolean
+        default: true
+      enable_performance:
+        description: "Enable WildKernels Performance Tuning & Compression Patches (LZ4/ZSTD)"
+        type: boolean
+        default: true
+
+      mosey_mode:
+        description: "Mosey Extended (wonder_mosey_wild) Driver Integration Mode"
+        type: choice
+        options:
+          - builtin
+          - module
+          - both
+          - disabled
+        default: both
+      mosey_mac_addr:
+        description: "Default Locally-Administered MAC for Mosey wonder0 (NL80211 vendor subcmd 5)"
+        type: string
+        default: "6a:b0:5d:c7:27:3d"
+      enable_nlmon:
+        description: "Enable CONFIG_NLMON=y (nlmon0 netlink pcap capture for Mosey debugging)"
+        type: boolean
+        default: true
+
+jobs:
+  generate-matrix:
+    name: "Resolve Kernel & Root Matrix"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Build Dynamic Matrix JSON
+        id: set-matrix
+        shell: bash
+        run: |
+          python3 - << 'EOF'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          req_family = "${{ inputs.kernel_build_version }}"
+          req_lts = "${{ inputs.gki_lts_version }}".strip()
+          req_kmi = "auto"
+          req_root = "${{ inputs.root_variant }}"
+          if req_root == "All":
+              roots = ["RKSU", "xxksu", "HyperSU"]
+          else:
+              roots = [req_root]
+
+          all_families = [
+              {"kernel_version": "android14-6.1",  "kver": "6.1",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android15-6.6",  "kver": "6.6",  "susfs_branch": "gki-android15-6.6",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android16-6.12", "kver": "6.12", "susfs_branch": "gki-android16-6.12", "cache_type": "bazel", "build_tool": "bazel"},
+          ]
+
+          selected = all_families if req_family == "all" else [f for f in all_families if f["kernel_version"] == req_family]
+
+          if req_kmi != "auto" and not req_kmi.isdigit():
+              print(f"::error::kmi_generation is '{req_kmi}': use 'auto' or the number from `uname -r` (…-android16-6-… is 6)")
+              sys.exit(1)
+
+          GOOGLE = "https://android.googlesource.com"
+
+          def fetch(url):
+              for attempt in (1, 2, 3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as r:
+                          return r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404 or attempt == 3:
+                          raise
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                  time.sleep(2 * attempt)
+
+          def gitiles(repo, ref, path):
+              return base64.b64decode(fetch(f"{GOOGLE}/{repo}/+/refs/heads/{ref}/{path}?format=TEXT")).decode("utf-8", "replace")
+
+          def manifest_branches():
+              return list(json.loads(fetch(f"{GOOGLE}/kernel/manifest/+refs/heads?format=JSON").decode().split("\n", 1)[1]))
+
+          _seen = {}
+          def branch_info(manifest_branch):
+              """Version and KMI generation at the tip of what a manifest syncs, or None."""
+              if manifest_branch not in _seen:
+                  try:
+                      manifest = gitiles("kernel/manifest", manifest_branch, "default.xml")
+                      proj = re.search(r'<project[^>]*path="common"[^>]*>', manifest)
+                      rev = re.search(r'revision="([^"]+)"', proj.group(0)) if proj else None
+                      rev = (rev or re.search(r'<default[^>]*revision="([^"]+)"', manifest)).group(1)
+                      makefile = gitiles("kernel/common", rev, "Makefile")
+                      version = ".".join(re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
+                                         for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL"))
+                      kmi = None
+                      for f in ("build.config.constants", "build.config.common"):
+                          try:
+                              m = re.search(r"^KMI_GENERATION=(\d+)", gitiles("kernel/common", rev, f), re.M)
+                          except Exception:
+                              m = None
+                          if m:
+                              kmi = int(m.group(1))
+                              break
+                      _seen[manifest_branch] = {"manifest": manifest_branch, "branch": rev, "version": version, "kmi": kmi}
+                  except Exception:
+                      _seen[manifest_branch] = None
+              return _seen[manifest_branch]
+
+          def pick_branch(fam, kmi, asked):
+              """Which of Google's branches to build for this family.
+
+              kmi is 'auto' or a generation number, asked is a full x.y.z or None.
+
+              The phone's drivers are built for one KMI generation and only load on a
+              kernel of that same generation. The -lts branch moves on to the next one
+              before any phone does: 6.12 -lts went to 7 while every release Google has
+              cut, and with it the Pixel 10, is on 6 - and a generation-7 kernel on
+              that phone is a bootloop. So "newest code" and "boots" are not always the
+              same branch: take -lts while it is on the wanted generation, otherwise
+              the newest dated release branch that is.
+              """
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+
+              def releases(gen):
+                  seen_one = False
+                  for b in dated:
+                      i = branch_info(b)
+                      if not i or not i["kmi"]:
+                          if seen_one:
+                              return
+                          continue
+                      seen_one = True
+                      if i["kmi"] < gen:
+                          return
+                      if i["kmi"] == gen:
+                          yield i
+
+              if kmi.isdigit():
+                  want = int(kmi)
+              else:
+                  want = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if want is None and lts:
+                      want = lts["kmi"]
+              if want is None:
+                  print(f"::error::{name}: could not read Google's branches to work out the KMI generation. "
+                        f"Nothing built - run it again.")
+                  sys.exit(1)
+
+              if lts and lts["kmi"] == want:
+                  ref = next(releases(want), None)
+                  return dict(lts, ref=ref["branch"] if ref else "", ref_exact="false")
+
+              src = None
+              if asked:
+                  src = next((i for i in releases(want) if i["version"] == asked), None)
+              src = src or next(releases(want), None)
+              if src:
+                  print(f"[i] {name}: -lts is on KMI generation {lts['kmi'] if lts else '?'}, "
+                        f"building {src['branch']} ({src['version']}) which is on {want}")
+                  return dict(src, ref=src["branch"], ref_exact="true")
+
+              have = sorted({i["kmi"] for i in map(branch_info, dated[:6]) if i and i["kmi"]} | ({lts["kmi"]} if lts else set()))
+              msg = f"{name}: no branch on KMI generation {want} (Google has {', '.join(map(str, have)) or 'none readable'})."
+              if len(selected) == 1 or not kmi.isdigit():
+                  print(f"::error::{msg}")
+                  sys.exit(1)
+              print(f"::warning::{msg} Using 'auto' for this family.")
+              return None
+
+          def requested(fam):
+              if req_lts.isdigit():
+                  return f'{fam["kver"]}.{int(req_lts)}'
+              if re.fullmatch(re.escape(fam["kver"]) + r"\.\d+", req_lts):
+                  return f'{fam["kver"]}.{int(req_lts.rsplit(".", 1)[1])}'
+              return None
+
+          req_all = req_lts.upper() == "ALL"
+
+          def wanted_gen(fam):
+              """The -lts branch info, the family's dated release branches (newest
+              first), and the KMI generation we build for (req_kmi, or the newest
+              Google has)."""
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+              if req_kmi.isdigit():
+                  gen = int(req_kmi)
+              else:
+                  gen = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if gen is None and lts:
+                      gen = lts["kmi"]
+              return lts, dated, gen
+
+          def list_sources(fam):
+              """Every distinct sublevel to build for 'All': the -lts tip (when it is
+              on the wanted generation) plus each dated release branch on it, newest
+              first, deduped by version. A gen-7 kernel on a gen-6 phone bootloops,
+              so nothing off the wanted generation is ever added."""
+              lts, dated, gen = wanted_gen(fam)
+              on_gen, seen_gen = [], False
+              for b in dated:
+                  i = branch_info(b)
+                  if not i or not i["kmi"]:
+                      if seen_gen:
+                          break
+                      continue
+                  if i["kmi"] < gen:
+                      break
+                  if i["kmi"] == gen:
+                      seen_gen = True
+                      on_gen.append(i)
+              out, seen = [], set()
+              if lts and lts["kmi"] == gen:
+                  out.append(dict(lts, ref=on_gen[0]["branch"] if on_gen else "", ref_exact="false"))
+                  seen.add(lts["version"])
+              for i in on_gen:
+                  if i["version"] in seen:
+                      continue
+                  out.append(dict(i, ref=i["branch"], ref_exact="true"))
+                  seen.add(i["version"])
+              return out, gen
+
+          if not req_all and req_lts and req_lts.upper() != "LTS" and not any(requested(f) for f in selected):
+              print(f"::warning::gki_lts_version '{req_lts}' is not a sublevel of the selected family; building the branch tip instead")
+
+          include = []
+          for fam in selected:
+              if req_all:
+                  srcs, gen = list_sources(fam)
+                  if not srcs:
+                      print(f"::error::{fam['kernel_version']}: found no branch on KMI generation {gen} to build. Nothing built - run it again.")
+                      sys.exit(1)
+                  built = []
+                  for src in srcs:
+                      entry = dict(fam)
+                      entry["manifest_branch"] = src["manifest"]
+                      entry["gki_branch"] = src["branch"]
+                      entry["kmi_generation"] = str(src["kmi"] or "")
+                      entry["kmi_ref_branch"] = src["ref"]
+                      entry["kmi_ref_exact"] = src["ref_exact"]
+                      entry["lts_version"] = src["version"] or f'{fam["kver"]}-LTS'
+                      entry["follow_tip"] = "true" if src["ref_exact"] == "false" else "false"
+                      for r in roots:
+                          e = dict(entry)
+                          e["root_variant"] = r
+                          include.append(e)
+                      built.append(src["version"] or "tip")
+                  print(f"[i] {fam['kernel_version']}: building all {len(srcs)} sublevel(s) on KMI {gen}: {', '.join(built)}")
+                  continue
+              entry = dict(fam)
+              want = requested(fam)
+              src = pick_branch(fam, req_kmi, want) or pick_branch(fam, "auto", want)
+              entry["manifest_branch"] = src["manifest"]
+              entry["gki_branch"] = src["branch"]
+              entry["kmi_generation"] = str(src["kmi"] or "")
+              entry["kmi_ref_branch"] = src["ref"]
+              entry["kmi_ref_exact"] = src["ref_exact"]
+              tip = src["version"]
+              if want == tip:
+                  want = None
+              if want and tip and int(want.rsplit(".", 1)[1]) > int(tip.rsplit(".", 1)[1]):
+                  msg = f"{want} does not exist on {src['branch']}, which is at {tip}."
+                  if len(selected) == 1:
+                      print(f"::error::{msg} Use 'LTS' or a sublevel up to {tip.rsplit('.', 1)[1]}.")
+                      sys.exit(1)
+                  print(f"::warning::{msg} Building {tip} for this family.")
+                  want = None
+              if want:
+                  entry["lts_version"] = want
+                  entry["follow_tip"] = "false"
+              else:
+                  entry["lts_version"] = tip or f'{fam["kver"]}-LTS'
+                  entry["follow_tip"] = "true"
+              for r in roots:
+                  e = dict(entry)
+                  e["root_variant"] = r
+                  include.append(e)
+
+          if len(include) > 256:
+              print(f"::error::this selection makes {len(include)} jobs and GitHub caps a matrix at 256. Narrow it: one family, 'LTS' or a single sublevel, or fewer root variants.")
+              sys.exit(1)
+
+          matrix_json = json.dumps({"include": include})
+          print("Generated matrix:", matrix_json)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={matrix_json}\n")
+          EOF
+
+  build-fork-pipeline:
+    name: "Fork Pipeline: ${{ matrix.kernel_version }} (${{ matrix.lts_version }})"
+    needs: generate-matrix
+    if: ${{ inputs.build_variant == 'wildkernels-fork-pipeline' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout WildKernels Repository
+        uses: actions/checkout@v4
+
+      - name: Inject Mosey Extended Driver Hook into .github/actions/build-kernel
+        if: ${{ inputs.mosey_mode != 'disabled' }}
+        shell: bash
+        run: |
+          mkdir -p .github/mosey
+          git clone --depth=1 https://github.com/thelok1s/mosey-extended.git /tmp/mosey_extended || true
+
+          if [ -f /tmp/mosey_extended/agy/ksu_wonder_module/mosey_wonder/wonder_mosey_wild.c ]; then
+            cp -f /tmp/mosey_extended/agy/ksu_wonder_module/mosey_wonder/wonder_mosey_wild.c .github/mosey/wonder_mosey_wild.c
+          elif [ -f /tmp/mosey_extended/system/vendor/bin/wonder/wonder_mosey_wild.c ]; then
+            cp -f /tmp/mosey_extended/system/vendor/bin/wonder/wonder_mosey_wild.c .github/mosey/wonder_mosey_wild.c
+          fi
+
+          cat << 'EOF' > .github/mosey/inject_mosey.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          KSRC_DIR="${1:-common}"
+          MOSEY_MODE="${2:-both}"
+          DEFAULT_MAC="${3:-6a:b0:5d:c7:27:3d}"
+          ENABLE_NLMON="${4:-true}"
+
+          if [ ! -d "$KSRC_DIR/drivers/net/wireless" ]; then
+            exit 0
+          fi
+
+          if [ -f "$GITHUB_WORKSPACE/.github/mosey/wonder_mosey_wild.c" ]; then
+            cp -f "$GITHUB_WORKSPACE/.github/mosey/wonder_mosey_wild.c" "$KSRC_DIR/drivers/net/wireless/wonder_mosey_wild.c"
+            sed -i "s/6a:b0:5d:c7:27:3d/${DEFAULT_MAC}/g" "$KSRC_DIR/drivers/net/wireless/wonder_mosey_wild.c"
+          fi
+
+          if ! grep -q "wonder_mosey_wild" "$KSRC_DIR/drivers/net/wireless/Makefile"; then
+            if [ "$MOSEY_MODE" = "module" ]; then
+              echo "obj-m += wonder_mosey_wild.o" >> "$KSRC_DIR/drivers/net/wireless/Makefile"
+            else
+              echo "obj-y += wonder_mosey_wild.o" >> "$KSRC_DIR/drivers/net/wireless/Makefile"
+            fi
+          fi
+
+          # cfg80211/mac80211 are NOT forced into the image on GKI (they are
+          # vendor modules); the wonder phy loads against the device's own
+          # cfg80211. Nothing to add to the defconfig here.
+          :
+          EOF
+          chmod +x .github/mosey/inject_mosey.sh
+
+          if [ -f .github/actions/build-kernel/action.yml ]; then
+            sed -i 's|tools/bazel|bash "$GITHUB_WORKSPACE/.github/mosey/inject_mosey.sh" common "${{ inputs.mosey_mode }}" "${{ inputs.mosey_mac_addr }}" "${{ inputs.enable_nlmon }}" \&\& tools/bazel|g' .github/actions/build-kernel/action.yml
+          fi
+
+      - name: Run WildKernels Build Action
+        if: hashFiles('.github/actions/build-kernel/action.yml') != ''
+        uses: ./.github/actions/build-kernel
+        with:
+          version: ${{ matrix.kernel_version }}
+          page_size: ${{ inputs.page_size }}
+          allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
+
+  build-all-versions-mosey:
+    name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | ${{ matrix.root_variant }} + Mosey)"
+    needs: generate-matrix
+    if: ${{ inputs.build_variant == 'standalone-matrix' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout WildKernels Fork Repository (for finasu_compat / bakasu_compat / susfs scripts)
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Maximize Runner Disk Space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Build Dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git git-lfs gnupg gperf \
+            libelf-dev libncurses5-dev libssl-dev libxml2-utils lz4 pahole \
+            python3 python3-pip rsync unzip wget xz-utils zip zstd \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          mkdir -p ~/bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Build Cache (${{ matrix.cache_type }})
+        if: ${{ inputs.use_cache }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/ccache
+          key: wildkernel-mosey-${{ matrix.kernel_version }}-${{ matrix.lts_version }}-${{ matrix.root_variant }}-${{ github.run_id }}
+          restore-keys: |
+            wildkernel-mosey-${{ matrix.kernel_version }}-${{ matrix.lts_version }}-${{ matrix.root_variant }}-
+            wildkernel-mosey-${{ matrix.kernel_version }}-
+
+      - name: Sync Google GKI Kernel Manifest (${{ matrix.manifest_branch }})
+        id: sync-kernel
+        shell: bash
+        run: |
+          mkdir -p kernel_workspace && cd kernel_workspace
+          repo init -u https://android.googlesource.com/kernel/manifest -b "${{ matrix.manifest_branch }}" --depth=1
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
+
+          cd common
+          VERSION=$(grep -E '^VERSION = ' Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep -E '^PATCHLEVEL = ' Makefile | awk '{print $3}')
+          CURRENT_SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          REQ_LTS="${{ matrix.lts_version }}"
+
+          if [ -n "$REQ_LTS" ] && [ "$REQ_LTS" != "lts" ]; then
+            TARGET_SUBLEVEL=$(echo "$REQ_LTS" | cut -d. -f3)
+            if [ -n "$TARGET_SUBLEVEL" ] && [ "$CURRENT_SUBLEVEL" != "$TARGET_SUBLEVEL" ]; then
+              git fetch --unshallow aosp || true
+              MATCH_COMMIT=$(git log --grep="Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}" -n 1 --format="%H" || true)
+              if [ -n "$MATCH_COMMIT" ]; then
+                echo "[+] Checking out exact commit for Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}: $MATCH_COMMIT"
+                git checkout "$MATCH_COMMIT"
+              else
+                echo "::warning::${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL} is not in this branch - building the tip, ${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
+                TARGET_SUBLEVEL="$CURRENT_SUBLEVEL"
+              fi
+              CURRENT_SUBLEVEL="$TARGET_SUBLEVEL"
+            fi
+          fi
+
+          RESOLVED_KVER="${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
+          echo "resolved_kver=${RESOLVED_KVER}" >> "$GITHUB_OUTPUT"
+          echo "resolved_sublevel=${CURRENT_SUBLEVEL}" >> "$GITHUB_OUTPUT"
+          echo "[*] Building kernel version: ${RESOLVED_KVER} (${{ matrix.kernel_version }})"
+
+      - name: Fetch WildKernels Patches, SUSFS (${{ matrix.susfs_branch }}), and Mosey Extended
+        shell: bash
+        run: |
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git wild_patches
+          git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
+            git clone --depth=1 -b "${{ matrix.susfs_branch }}" https://github.com/ShirkNeko/susfs4ksu.git susfs4ksu || true
+          git clone --depth=1 https://github.com/thelok1s/mosey-extended.git mosey_extended
+
+      - name: Integrate Root Implementation (${{ matrix.root_variant }})
+        if: ${{ matrix.root_variant != 'NoRoot' }}
+        shell: bash
+        run: |
+          cd kernel_workspace
+          DRIVERS_DIR="common/drivers"
+          rm -rf "$DRIVERS_DIR/kernelsu"
+
+          case "${{ matrix.root_variant }}" in
+            RKSU)
+              ROOT_REPO="https://github.com/rsuntk/KernelSU.git"
+              ROOT_DIR="RKSU"
+              ROOT_BRANCH="main"
+              ;;
+            xxksu)
+              ROOT_REPO="https://github.com/backslashxx/KernelSU.git"
+              ROOT_DIR="xxksu"
+              ROOT_BRANCH="master"
+              ;;
+            HyperSU)
+              ROOT_REPO="https://github.com/HyperSU-Team/HyperSU.git"
+              ROOT_DIR="HyperSU"
+              ROOT_BRANCH="main"
+              ;;
+          esac
+
+          echo "[+] Cloning ${ROOT_DIR} from ${ROOT_REPO}..."
+          rm -rf "$ROOT_DIR"
+          if [ -n "$ROOT_BRANCH" ]; then
+            git clone --depth=1 -b "$ROOT_BRANCH" "$ROOT_REPO" "$ROOT_DIR" || git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
+          else
+            git clone --depth=1 "$ROOT_REPO" "$ROOT_DIR"
+          fi
+
+          if [ ! -d "$ROOT_DIR/kernel" ]; then
+            echo "[-] Error: $ROOT_DIR/kernel directory not found!"
+            exit 1
+          fi
+
+          REL_KERNEL="$(realpath --relative-to="$DRIVERS_DIR" "$PWD/$ROOT_DIR/kernel")"
+          ln -s "$REL_KERNEL" "$DRIVERS_DIR/kernelsu"
+          echo "[+] Linked $DRIVERS_DIR/kernelsu -> $REL_KERNEL"
+
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' "$DRIVERS_DIR/Makefile" || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$DRIVERS_DIR/Makefile"
+
+          if [ -f "$DRIVERS_DIR/Kconfig" ] && ! grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
+          fi
+
+
+      - name: Apply SUSFS (${{ matrix.susfs_branch }}) & Regular WildKernels Feature Patches
+        shell: bash
+        run: |
+          cd kernel_workspace
+          PATCH_DIR="$GITHUB_WORKSPACE/kernel_workspace/wild_patches"
+          SUSFS_DIR="$GITHUB_WORKSPACE/kernel_workspace/susfs4ksu"
+          KVER_SHORT="${{ matrix.kver }}"
+          SUBLEVEL="${{ steps.sync-kernel.outputs.resolved_sublevel }}"
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
+            echo "[+] Copying SUSFS fs/ and include/linux/ sources..."
+            cp -rf "$SUSFS_DIR/kernel_patches/fs/"* common/fs/ || true
+            cp -rf "$SUSFS_DIR/kernel_patches/include/linux/"* common/include/linux/ || true
+
+            case "${{ matrix.root_variant }}" in
+              KernelSU)
+                if [ -d "$SUSFS_DIR/kernel_patches/KernelSU" ]; then
+                  for kp in "$SUSFS_DIR"/kernel_patches/KernelSU/*.patch; do
+                    [ -f "$kp" ] && (cd KernelSU && patch -p1 --forward --fuzz=3 < "$kp") || true
+                  done
+                fi
+                ;;
+              BakaSU)
+                if [ -f "$GITHUB_WORKSPACE/.github/actions/susfs/bakasu_compat/apply.sh" ]; then
+                  bash "$GITHUB_WORKSPACE/.github/actions/susfs/bakasu_compat/apply.sh" BakaSU "${{ matrix.kernel_version }}" "${SUBLEVEL}" || true
+                fi
+                ;;
+              *)
+                echo "[+] ${{ matrix.root_variant }}: native SUSFS, kernel-side 50_add only (no 10_enable / no compat)"
+                ;;
+            esac
+
+            cd common
+            for p in "$SUSFS_DIR"/kernel_patches/50_add_susfs_in_gki-*.patch; do
+              [ -f "$p" ] && patch -p1 --forward --fuzz=3 < "$p" || true
+            done
+
+
+            case "$KVER_SHORT" in
+              5.10|5.15) [ -f "$PATCH_DIR/gki_ptrace.patch" ] && patch -p1 --forward --fuzz=3 < "$PATCH_DIR/gki_ptrace.patch" || true ;;
+            esac
+
+            case "$KVER_SHORT" in
+              5.10|5.15) U="$PATCH_DIR/common/unicode_bypass_fix_6.1-.patch" ;;
+              *)         U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch" ;;
+            esac
+            [ -f "$U" ] && patch -p1 --forward --fuzz=3 < "$U" || true
+          else
+            cd common
+          fi
+
+          find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
+
+          if [ "${{ inputs.enable_bbg }}" = "true" ]; then
+            echo "[+] Integrating Baseband Guard (BBG)..."
+            curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+            find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+            if [ -d security/baseband-guard ]; then
+              sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+              DEF="arch/arm64/configs/gki_defconfig"
+              if grep -q '^CONFIG_LSM=' "$DEF" && ! grep -q '^CONFIG_LSM=.*baseband_guard' "$DEF"; then
+                sed -i 's/^\(CONFIG_LSM="[^"]*\)selinux/\1selinux,baseband_guard/' "$DEF"
+              fi
+              grep -q baseband_guard security/Kconfig \
+                && echo "[+] baseband_guard added to CONFIG_LSM default" \
+                || echo "::warning::BBG: could not add baseband_guard to CONFIG_LSM"
+            fi
+          fi
+
+          if [ "${{ inputs.nv_write_guard }}" = "true" ]; then
+            echo "[+] Integrating NV write guard (nv_guard LSM)..."
+            NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
+            if [ ! -f security/nv_guard/nv_guard.c ] && [ -f "$NVD/nv_guard.c" ]; then
+              mkdir -p security/nv_guard
+              cp "$NVD/nv_guard.c" "$NVD/Kconfig" "$NVD/Makefile" security/nv_guard/
+              echo "[+] nv_guard sources copied into security/nv_guard/"
+            fi
+            if [ -f security/nv_guard/nv_guard.c ]; then
+              grep -q 'security/nv_guard/Kconfig' security/Kconfig || \
+                sed -i 's#^source "security/keys/Kconfig"#&\nsource "security/nv_guard/Kconfig"#' security/Kconfig
+              grep -q 'nv_guard/' security/Makefile || \
+                printf 'obj-$(CONFIG_NV_WRITE_GUARD) += nv_guard/\n' >> security/Makefile
+              DEF="arch/arm64/configs/gki_defconfig"
+              grep -q '^CONFIG_NV_WRITE_GUARD=y' "$DEF" || echo 'CONFIG_NV_WRITE_GUARD=y' >> "$DEF"
+              sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /nv_guard/! s/selinux/selinux,nv_guard/ } }' security/Kconfig
+              if grep -q '^CONFIG_LSM=' "$DEF" && ! grep -q '^CONFIG_LSM=.*nv_guard' "$DEF"; then
+                sed -i 's/^\(CONFIG_LSM="[^"]*\)selinux/\1selinux,nv_guard/' "$DEF"
+              fi
+              echo "[+] nv_guard wired (sources + Kconfig/Makefile + CONFIG_LSM)"
+            else
+              echo "::warning::nv_write_guard requested but kernel-patches/nv_guard sources not found; skipping"
+            fi
+          fi
+
+          case "${{ inputs.security_patches }}" in
+            latest-cve)
+              echo "[+] security_patches=latest-cve: topping up with post-release stable CVE fixes..."
+              git config user.email "ci@local" 2>/dev/null || true
+              git config user.name "ci" 2>/dev/null || true
+              KVER="$(make -s kernelversion 2>/dev/null || true)"
+              SERIES="$(echo "$KVER" | cut -d. -f1-2)"
+              OUTD="$GITHUB_WORKSPACE/cve-out"; mkdir -p "$OUTD"
+              OKF="$OUTD/cve-applied.txt"; SKF="$OUTD/cve-skipped.txt"; : > "$OKF"; : > "$SKF"
+              STABLE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git"
+              if git fetch --no-tags --depth=400 "$STABLE" "linux-${SERIES}.y:refs/cve_tip" "refs/tags/v${KVER}:refs/tags/v${KVER}" 2>/dev/null; then
+                for d in 800 1600 3200; do
+                  git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null && break
+                  git fetch --no-tags --deepen="$d" "$STABLE" "linux-${SERIES}.y:refs/cve_tip" 2>/dev/null || break
+                done
+                if git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null; then
+                  mapfile -t SHAS < <(git rev-list --reverse "v${KVER}..refs/cve_tip" 2>/dev/null)
+                  echo "[i] ${SERIES}: ${#SHAS[@]} post-${KVER} stable commits to try"
+                  for sha in "${SHAS[@]}"; do
+                    subj="$(git log -1 --format='%s' "$sha" 2>/dev/null || true)"
+                    if git format-patch -1 --stdout "$sha" 2>/dev/null | git am --3way >/dev/null 2>&1; then
+                      echo "$sha  $subj" >> "$OKF"
+                    else
+                      git am --abort >/dev/null 2>&1 || true
+                      echo "$sha  $subj" >> "$SKF"
+                    fi
+                  done
+                  echo "[+] latest-cve: applied $(wc -l < "$OKF" | tr -d ' '), skipped $(wc -l < "$SKF" | tr -d ' ') (lists in cve-out/)"
+                else
+                  echo "::warning::latest-cve: base tag v${KVER} not reachable in the synced tree; skipping CVE top-up (monthly base is unchanged)"
+                fi
+              else
+                echo "::warning::latest-cve: could not fetch the stable tree for ${SERIES}; skipping CVE top-up"
+              fi
+              ;;
+            none)
+              echo "[i] security_patches=none: building the base exactly as pinned"
+              ;;
+            *)
+              echo "[i] security_patches=monthly: latest tagged GKI/LTS base carries the Android monthly CVE set"
+              ;;
+          esac
+
+          if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
+            echo "[+] Applying NTSync for ${{ matrix.kernel_version }}..."
+            NT="$PATCH_DIR/common/ntsync"
+            if [ "${{ matrix.kernel_version }}" = "android16-6.12" ]; then
+              rm -f include/uapi/linux/ntsync.h drivers/misc/ntsync.c
+            fi
+            case "${{ matrix.kernel_version }}" in
+              android13-5.10) COMPAT="$NT/ntsync_compat_android12-5.10.patch" ;;
+              android14-5.15) COMPAT="$NT/ntsync_compat_android13-5.15.patch" ;;
+              *)              COMPAT="$NT/ntsync_compat_${{ matrix.kernel_version }}.patch" ;;
+            esac
+            if [ -f "$COMPAT" ]; then patch -p1 --forward --fuzz=3 < "$COMPAT" || true; else echo "::warning::NTSync: compat patch not found ($COMPAT)"; fi
+            if [ -f "$NT/ntsync_base.patch" ]; then patch -p1 --forward --fuzz=3 < "$NT/ntsync_base.patch" || true; else echo "::warning::NTSync: ntsync_base.patch not found"; fi
+          fi
+
+          if [ "${{ inputs.enable_networking }}" = "true" ]; then
+            echo "[+] Applying Networking patches for ${KVER_SHORT}..."
+            find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+          fi
+
+          if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
+            echo "[+] Applying DroidSpaces-OSS patches..."
+            find "$PATCH_DIR" -name "*droidspaces*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
+          fi
+
+          if [ "${{ inputs.enable_performance }}" = "true" ]; then
+            echo "[+] Applying WildKernels performance patches..."
+            for name in \
+              add_timeout_wakelocks_globally adjust_cpu_scan_order \
+              avoid_extra_s2idle_wake_attempts clear_page_16bytes_align \
+              disable_cache_hot_buddy f2fs_enlarge_min_fsync_blocks \
+              f2fs_reduce_congestion file_struct_8bytes_align \
+              increase_ext4_default_commit_age increase_sk_mem_packets \
+              int_sqrt mem_opt_prefetch minimise_wakeup_time optimise_memcmp \
+              optimized_mem_operations reduce_cache_pressure reduce_freeze_timeout \
+              reduce_gc_thread_sleep_time reduce_pci_pme_wakeups \
+              use_unlikely_wrap_cpufreq; do
+              p="$PATCH_DIR/common/${name}.patch"
+              [ -f "$p" ] || continue
+              if patch -p1 -N -s --dry-run -i "$p" >/dev/null 2>&1; then
+                patch -p1 -N -s --no-backup-if-mismatch -i "$p"
+                echo "  [ok]   $name"
+              else
+                echo "  [skip] $name (doesn't apply on ${{ matrix.kernel_version }})"
+              fi
+            done
+          fi
+
+          if [ "${{ inputs.allow_version_mismatch }}" = "true" ]; then
+            echo "[+] Applying Module Check Bypass..."
+            if [ -f kernel/module/version.c ]; then
+              sed -i 's/return 0;/return 1;/g' kernel/module/version.c || true
+            elif [ -f kernel/module.c ]; then
+              sed -i '/check_version/,/^}/ s/return 0;/return 1;/g' kernel/module.c || true
+            fi
+          fi
+
+          find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
+
+      - name: Prepare Mosey wonder driver source (out-of-tree, cfg80211-only)
+        if: ${{ inputs.mosey_mode != 'disabled' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/mosey_src"
+          rm -rf "$SRC"; mkdir -p "$SRC"
+
+          cat > "$SRC/Kbuild" <<'KBUILD_EOF'
+          obj-m += wonder_mosey_wild.o
+          KBUILD_EOF
+
+          cat > "$SRC/wonder_mosey_wild.c" <<'WONDER_EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * wonder_mosey_wild - fake "wonder" wiphy for Mosey (Quick Share / AirDrop)
+           *
+           * mosey_server wants a phy called "wonder" it can hang a monitor
+           * interface off (wonder0), tune to ch149 and poke with Broadcom-style
+           * vendor commands (OUI 0x001A11, subcmds 1..5). Pixel 9/10 get that from
+           * bcmdhd's wondertap, everything else gets this.
+           *
+           * Interface follows thelok1s/mosey-extended's README. This is a plain
+           * cfg80211 driver on purpose: phones ship cfg80211 as a vendor module but
+           * most never load mac80211, so depending on it would rule out half the
+           * devices out there.
+           *
+           * No radio behind it. Frames sent on wonder0 are dropped, nothing is ever
+           * received. It only exists so mosey_server's bring-up completes.
+           *
+           * Pixel 10 series (blazer) has native wondertap in the BCM4398 (bcmdhd), so
+           * there this driver is a no-op fallback - it loads only on devices that have
+           * no real wonder phy. The 5 GHz table leads with ch149/5745, the channel
+           * Quick Share / mosey uses, so an emulated phy advertises it first.
+           *
+           * @Dev_DcS
+           */
+
+          #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+          #include <linux/module.h>
+          #include <linux/moduleparam.h>
+          #include <linux/etherdevice.h>
+          #include <linux/netdevice.h>
+          #include <linux/if_arp.h>
+          #include <linux/rtnetlink.h>
+          #include <linux/spinlock.h>
+          #include <linux/version.h>
+          #include <net/cfg80211.h>
+          #include <net/netlink.h>
+
+          #define WONDER_OUI		0x001A11
+          #define WONDER_MAX_IFACES	4
+
+          enum wonder_subcmd {
+          	WONDER_SET_FREQ		= 1,
+          	WONDER_SET_FILTER	= 2,
+          	WONDER_SET_FIXED_TX_RATE = 3,
+          	WONDER_SET_REG		= 4,
+          	WONDER_GET_IF_MAC_ADDR	= 5,
+          };
+
+          /*
+           * 5.12 moved interface add/del under the wiphy mutex and gave drivers
+           * cfg80211_{,un}register_netdevice() for it.
+           */
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+          #define WONDER_WIPHY_MTX 1
+          #endif
+
+          static struct wiphy *wonder_wiphy;
+
+          /* ---- module params ---------------------------------------------------- */
+
+          static DEFINE_SPINLOCK(wonder_mac_lock);
+          static u8 wonder_mac[ETH_ALEN] = { 0x6a, 0xb0, 0x5d, 0xc7, 0x27, 0x3d };
+
+          static void wonder_get_mac(u8 *out)
+          {
+          	spin_lock_bh(&wonder_mac_lock);
+          	ether_addr_copy(out, wonder_mac);
+          	spin_unlock_bh(&wonder_mac_lock);
+          }
+
+          static int wonder_mac_set(const char *val, const struct kernel_param *kp)
+          {
+          	char buf[24];	/* "xx:xx:xx:xx:xx:xx" plus whatever echo tacks on */
+          	u8 mac[ETH_ALEN];
+
+          	if (strscpy(buf, val, sizeof(buf)) < 0)
+          		return -EINVAL;
+          	if (!mac_pton(strim(buf), mac))
+          		return -EINVAL;
+          	/* unicast + locally administered, same rule mosey-extended documents */
+          	if (!is_valid_ether_addr(mac) || !(mac[0] & 0x02))
+          		return -EINVAL;
+
+          	spin_lock_bh(&wonder_mac_lock);
+          	ether_addr_copy(wonder_mac, mac);
+          	spin_unlock_bh(&wonder_mac_lock);
+          	return 0;
+          }
+
+          static int wonder_mac_get(char *buf, const struct kernel_param *kp)
+          {
+          	u8 mac[ETH_ALEN];
+
+          	wonder_get_mac(mac);
+          	return sysfs_emit(buf, "%pM\n", mac);
+          }
+
+          static const struct kernel_param_ops wonder_mac_ops = {
+          	.set = wonder_mac_set,
+          	.get = wonder_mac_get,
+          };
+          module_param_cb(mac_addr, &wonder_mac_ops, NULL, 0644);
+          MODULE_PARM_DESC(mac_addr,
+          	"MAC handed back for vendor subcmd 5 (locally administered, default 6a:b0:5d:c7:27:3d)");
+
+          /*
+           * Nobody outside Google knows how mosey_server unpacks the subcmd 5 reply.
+           * 0 = bare 6 bytes in VENDOR_DATA, 1 = wrapped in nl attribute 1.
+           * Writable so it can be flipped on a live device without rebuilding.
+           */
+          static int mac_reply_fmt;
+          module_param(mac_reply_fmt, int, 0644);
+          MODULE_PARM_DESC(mac_reply_fmt, "Subcmd 5 reply: 0 = raw bytes (default), 1 = nla type 1");
+
+          /* ---- monitor netdev --------------------------------------------------- */
+
+          static netdev_tx_t wonder_xmit(struct sk_buff *skb, struct net_device *dev)
+          {
+          	dev->stats.tx_dropped++;
+          	dev_kfree_skb_any(skb);
+          	return NETDEV_TX_OK;
+          }
+
+          static const struct net_device_ops wonder_netdev_ops = {
+          	.ndo_start_xmit = wonder_xmit,
+          };
+
+          static void wonder_netdev_setup(struct net_device *dev)
+          {
+          	ether_setup(dev);
+          	dev->type = ARPHRD_IEEE80211_RADIOTAP;
+          	dev->header_ops = NULL;
+          	dev->hard_header_len = 0;
+          	dev->netdev_ops = &wonder_netdev_ops;
+          	dev->needs_free_netdev = true;
+          	dev->priv_flags |= IFF_NO_QUEUE;
+          	dev->flags &= ~IFF_MULTICAST;
+          }
+
+          static struct wireless_dev *wonder_add_iface(struct wiphy *wiphy, const char *name,
+          					     unsigned char name_assign_type,
+          					     enum nl80211_iftype type,
+          					     struct vif_params *params)
+          {
+          	struct wireless_dev *wdev;
+          	struct net_device *dev;
+          	u8 mac[ETH_ALEN];
+          	int count = 0;
+          	int err;
+
+          	if (type != NL80211_IFTYPE_MONITOR)
+          		return ERR_PTR(-EOPNOTSUPP);
+
+          	list_for_each_entry(wdev, &wiphy->wdev_list, list)
+          		count++;
+          	if (count >= WONDER_MAX_IFACES)
+          		return ERR_PTR(-EBUSY);
+
+          	dev = alloc_netdev(sizeof(*wdev), name, name_assign_type, wonder_netdev_setup);
+          	if (!dev)
+          		return ERR_PTR(-ENOMEM);
+
+          	wonder_get_mac(mac);
+          	eth_hw_addr_set(dev, mac);
+
+          	wdev = netdev_priv(dev);
+          	wdev->wiphy = wiphy;
+          	wdev->iftype = type;
+          	wdev->netdev = dev;
+          	dev->ieee80211_ptr = wdev;
+          	SET_NETDEV_DEV(dev, wiphy_dev(wiphy));
+
+          #ifdef WONDER_WIPHY_MTX
+          	err = cfg80211_register_netdevice(dev);
+          #else
+          	err = register_netdevice(dev);
+          #endif
+          	if (err) {
+          		free_netdev(dev);
+          		return ERR_PTR(err);
+          	}
+
+          	netif_carrier_on(dev);
+          	pr_info("%s up on %s\n", dev->name, wiphy_name(wiphy));
+          	return wdev;
+          }
+
+          /* caller holds RTNL (and the wiphy mutex on 5.12+) */
+          static void wonder_drop_iface(struct wireless_dev *wdev)
+          {
+          	if (!wdev->netdev)
+          		return;
+          #ifdef WONDER_WIPHY_MTX
+          	cfg80211_unregister_netdevice(wdev->netdev);
+          #else
+          	unregister_netdevice(wdev->netdev);
+          #endif
+          }
+
+          static int wonder_del_iface(struct wiphy *wiphy, struct wireless_dev *wdev)
+          {
+          	wonder_drop_iface(wdev);
+          	return 0;
+          }
+
+          static int wonder_change_iface(struct wiphy *wiphy, struct net_device *dev,
+          			       enum nl80211_iftype type, struct vif_params *params)
+          {
+          	if (type != NL80211_IFTYPE_MONITOR)
+          		return -EOPNOTSUPP;
+          	/* cfg80211 WARNs if the driver says ok but iftype didn't follow */
+          	dev->ieee80211_ptr->iftype = type;
+          	return 0;
+          }
+
+          /*
+           * 6.13 started passing the netdev to .set_monitor_channel, and android16-6.12
+           * carries that change too while android15-6.6 and older don't. A version
+           * check gets that wrong (it did: this was keyed on 6.13 and broke on 6.12),
+           * so both forms are here and the compiler takes whichever one the ops
+           * struct of the tree being built against actually declares.
+           */
+          static int wonder_monitor_channel(struct cfg80211_chan_def *chandef)
+          {
+          	pr_debug("monitor channel %u MHz\n", chandef->chan->center_freq);
+          	return 0;
+          }
+
+          static int wonder_set_monitor_channel(struct wiphy *wiphy,
+          				      struct cfg80211_chan_def *chandef)
+          {
+          	return wonder_monitor_channel(chandef);
+          }
+
+          static int wonder_set_monitor_channel_dev(struct wiphy *wiphy,
+          					  struct net_device *dev,
+          					  struct cfg80211_chan_def *chandef)
+          {
+          	return wonder_monitor_channel(chandef);
+          }
+
+          #define WONDER_SET_MONITOR_CHANNEL					\
+          	__builtin_choose_expr(						\
+          		__same_type(((struct cfg80211_ops *)0)->set_monitor_channel, \
+          			    &wonder_set_monitor_channel_dev),		\
+          		wonder_set_monitor_channel_dev, wonder_set_monitor_channel)
+
+          static const struct cfg80211_ops wonder_cfg_ops = {
+          	.add_virtual_intf	= wonder_add_iface,
+          	.del_virtual_intf	= wonder_del_iface,
+          	.change_virtual_intf	= wonder_change_iface,
+          	.set_monitor_channel	= WONDER_SET_MONITOR_CHANNEL,
+          };
+
+          /* ---- vendor commands -------------------------------------------------- */
+
+          static int wonder_vendor_ack(struct wiphy *wiphy, struct wireless_dev *wdev,
+          			     const void *data, int len)
+          {
+          	/* subcmds 1-4 only configure hardware that isn't there */
+          	return 0;
+          }
+
+          static int wonder_vendor_get_mac(struct wiphy *wiphy, struct wireless_dev *wdev,
+          				 const void *data, int len)
+          {
+          	struct sk_buff *skb;
+          	u8 mac[ETH_ALEN];
+
+          	wonder_get_mac(mac);
+
+          	skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, nla_total_size(ETH_ALEN));
+          	if (!skb)
+          		return -ENOMEM;
+
+          	if (READ_ONCE(mac_reply_fmt) == 1) {
+          		if (nla_put(skb, 1, ETH_ALEN, mac)) {
+          			kfree_skb(skb);
+          			return -EMSGSIZE;
+          		}
+          	} else {
+          		skb_put_data(skb, mac, ETH_ALEN);
+          	}
+
+          	return cfg80211_vendor_cmd_reply(skb);
+          }
+
+          #define WONDER_VCMD(_sub, _fn) {				\
+          	.info	= { .vendor_id = WONDER_OUI, .subcmd = (_sub) },\
+          	.doit	= (_fn),					\
+          	.policy	= VENDOR_CMD_RAW_DATA,				\
+          }
+
+          /*
+           * No NEED_WDEV flag: whether mosey_server targets the phy or wonder0
+           * isn't documented, and without the flag nl80211 takes either.
+           */
+          static const struct wiphy_vendor_command wonder_vendor_cmds[] = {
+          	WONDER_VCMD(WONDER_SET_FREQ, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_SET_FILTER, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_SET_FIXED_TX_RATE, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_SET_REG, wonder_vendor_ack),
+          	WONDER_VCMD(WONDER_GET_IF_MAC_ADDR, wonder_vendor_get_mac),
+          };
+
+          /* ---- bands ------------------------------------------------------------ */
+
+          #define CHAN2G(_ch, _freq) { .band = NL80211_BAND_2GHZ, .center_freq = (_freq), \
+          			     .hw_value = (_ch), .max_power = 20 }
+          #define CHAN5G(_ch, _freq) { .band = NL80211_BAND_5GHZ, .center_freq = (_freq), \
+          			     .hw_value = (_ch), .max_power = 20 }
+
+          static struct ieee80211_channel wonder_chan_2g[] = {
+          	CHAN2G(1, 2412), CHAN2G(6, 2437), CHAN2G(11, 2462),
+          };
+
+          static struct ieee80211_channel wonder_chan_5g[] = {
+          	/* ch149/5745 first: the channel Quick Share / mosey (Pixel "blazer") uses */
+          	CHAN5G(149, 5745), CHAN5G(153, 5765), CHAN5G(157, 5785), CHAN5G(161, 5805),
+          	CHAN5G(36, 5180), CHAN5G(44, 5220),
+          };
+
+          static struct ieee80211_rate wonder_rates_2g[] = {
+          	{ .bitrate = 10 }, { .bitrate = 20 }, { .bitrate = 55 }, { .bitrate = 110 },
+          	{ .bitrate = 60 }, { .bitrate = 120 }, { .bitrate = 240 }, { .bitrate = 540 },
+          };
+
+          /* 5 GHz has no CCK, so it gets the OFDM tail of the same table */
+          static struct ieee80211_supported_band wonder_band_2g = {
+          	.band		= NL80211_BAND_2GHZ,
+          	.channels	= wonder_chan_2g,
+          	.n_channels	= ARRAY_SIZE(wonder_chan_2g),
+          	.bitrates	= wonder_rates_2g,
+          	.n_bitrates	= ARRAY_SIZE(wonder_rates_2g),
+          };
+
+          static struct ieee80211_supported_band wonder_band_5g = {
+          	.band		= NL80211_BAND_5GHZ,
+          	.channels	= wonder_chan_5g,
+          	.n_channels	= ARRAY_SIZE(wonder_chan_5g),
+          	.bitrates	= wonder_rates_2g + 4,
+          	.n_bitrates	= ARRAY_SIZE(wonder_rates_2g) - 4,
+          };
+
+          /* ---- init / exit ------------------------------------------------------ */
+
+          static int __init wonder_init(void)
+          {
+          	struct wiphy *wiphy;
+          	u8 mac[ETH_ALEN];
+          	int err;
+
+          	wiphy = wiphy_new_nm(&wonder_cfg_ops, 0, "wonder");
+          	if (!wiphy)
+          		return -ENOMEM;
+
+          	wonder_get_mac(mac);
+          	ether_addr_copy(wiphy->perm_addr, mac);
+
+          	wiphy->interface_modes = BIT(NL80211_IFTYPE_MONITOR);
+          	wiphy->bands[NL80211_BAND_2GHZ] = &wonder_band_2g;
+          	wiphy->bands[NL80211_BAND_5GHZ] = &wonder_band_5g;
+          	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+          	wiphy->vendor_commands = wonder_vendor_cmds;
+          	wiphy->n_vendor_commands = ARRAY_SIZE(wonder_vendor_cmds);
+          	/* mosey may ask for an "active" monitor; nothing here cares either way */
+          	wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR;
+
+          	err = wiphy_register(wiphy);
+          	if (err) {
+          		pr_err("wiphy_register: %d (is the phy name 'wonder' taken?)\n", err);
+          		wiphy_free(wiphy);
+          		return err;
+          	}
+
+          	wonder_wiphy = wiphy;
+          	pr_info("registered %s, mac %pM\n", wiphy_name(wiphy), mac);
+          	return 0;
+          }
+
+          static void __exit wonder_exit(void)
+          {
+          	struct wireless_dev *wdev, *tmp;
+          	struct wiphy *wiphy = wonder_wiphy;
+
+          	rtnl_lock();
+          #ifdef WONDER_WIPHY_MTX
+          	wiphy_lock(wiphy);
+          #endif
+          	list_for_each_entry_safe(wdev, tmp, &wiphy->wdev_list, list)
+          		wonder_drop_iface(wdev);
+          #ifdef WONDER_WIPHY_MTX
+          	wiphy_unlock(wiphy);
+          #endif
+          	rtnl_unlock();
+
+          	wiphy_unregister(wiphy);
+          	wiphy_free(wiphy);
+          }
+
+          module_init(wonder_init);
+          module_exit(wonder_exit);
+
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("Dev_DcS");
+          MODULE_DESCRIPTION("Virtual 'wonder' cfg80211 phy for Mosey / Quick Share");
+          MODULE_SOFTDEP("pre: cfg80211");
+          WONDER_EOF
+
+      - name: Configure Kernel (`gki_defconfig` & Kleaf Protected Exports for ${{ matrix.kernel_version }})
+        shell: bash
+        env:
+          CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
+        run: |
+          cd kernel_workspace/common
+          : > .scmversion 2>/dev/null || true
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+
+          set_kconfig() {
+            local key="$1"
+            local val="$2"
+            sed -i "/^${key}=/d" "$DEFCONFIG"
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG"
+            if [ "$val" = "n" ]; then
+              echo "# ${key} is not set" >> "$DEFCONFIG"
+            else
+              echo "${key}=${val}" >> "$DEFCONFIG"
+            fi
+          }
+
+          sed -i 's/-maybe-dirty//g; s/-dirty//g' scripts/setlocalversion 2>/dev/null || true
+          sed -i 's/-maybe-dirty//g' ../build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
+          set_kconfig CONFIG_LOCALVERSION_AUTO n
+          if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
+            KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
+            if [ -n "$KN" ]; then
+              set_kconfig CONFIG_LOCALVERSION "\"-$KN\""
+              echo "[+] Kernel name: -$KN"
+            fi
+          fi
+
+          set_kconfig CONFIG_WERROR n
+          echo "KBUILD_CFLAGS += -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-unused-label -Wno-unused-but-set-variable" >> Makefile
+
+          if [ "${{ matrix.root_variant }}" != "NoRoot" ]; then
+            set_kconfig CONFIG_KSU y
+            set_kconfig CONFIG_KALLSYMS_ALL y
+            set_kconfig CONFIG_KPROBES y
+          fi
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -f fs/susfs.c ]; then
+            set_kconfig CONFIG_KSU_SUSFS y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_PATH y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_MOUNT y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_KSTAT y
+            set_kconfig CONFIG_KSU_SUSFS_SPOOF_UNAME y
+            set_kconfig CONFIG_KSU_SUSFS_ENABLE_LOG y
+            set_kconfig CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS y
+            set_kconfig CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
+            set_kconfig CONFIG_KSU_SUSFS_OPEN_REDIRECT y
+            set_kconfig CONFIG_KSU_SUSFS_SUS_MAP y
+          fi
+
+          if [ "${{ inputs.metamodule }}" != "none" ]; then
+            set_kconfig CONFIG_TMPFS_XATTR y
+            set_kconfig CONFIG_TMPFS_POSIX_ACL y
+            case "${{ inputs.metamodule }}" in
+              Mountify|Hybrid) set_kconfig CONFIG_OVERLAY_FS y ;;
+            esac
+          fi
+
+          if [ "${{ inputs.enable_networking }}" = "true" ]; then
+            set_kconfig CONFIG_WIREGUARD y
+            set_kconfig CONFIG_TCP_CONG_ADVANCED y
+            set_kconfig CONFIG_TCP_CONG_BBR y
+            set_kconfig CONFIG_NET_SCH_FQ y
+            set_kconfig CONFIG_NET_SCH_CAKE y
+            set_kconfig CONFIG_IP_SET y
+            set_kconfig CONFIG_IP_SET_MAX 256
+            set_kconfig CONFIG_NETFILTER_XT_TARGET_HL y
+            set_kconfig CONFIG_NETFILTER_XT_TARGET_CONNMARK y
+            set_kconfig CONFIG_CIFS y
+          fi
+
+          if [ "${{ inputs.enable_bpf }}" = "true" ]; then
+            set_kconfig CONFIG_BPF_SYSCALL y
+            set_kconfig CONFIG_BPF_JIT y
+            set_kconfig CONFIG_DEBUG_INFO_BTF y
+          fi
+
+          if [ "${{ inputs.enable_ntsync }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
+            set_kconfig CONFIG_NTSYNC y
+          fi
+
+
+          sed -i 's/check_defconfig//' build.config.gki* || true
+          sed -i 's/TRIM_NONLISTED_KMI=1/TRIM_NONLISTED_KMI=0/g' build.config.gki* || true
+          sed -i 's/KMI_SYMBOL_LIST_STRICT_MODE=1/KMI_SYMBOL_LIST_STRICT_MODE=0/g' build.config.gki* || true
+
+          for f in android/abi_gki_protected_exports_*; do
+            [ -f "$f" ] && : > "$f"
+          done
+          for bzl in BUILD.bazel ../build/kernel/kleaf/common_kernels.bzl; do
+            if [ -f "$bzl" ]; then
+              sed -i 's/trim_nonlisted_kmi = True/trim_nonlisted_kmi = False/g' "$bzl" || true
+              sed -i 's/kmi_symbol_list_strict_mode = True/kmi_symbol_list_strict_mode = False/g' "$bzl" || true
+            fi
+          done
+
+
+      - name: Compile Kernel (${{ matrix.kernel_version }} - Auto Bazel / build.sh Dispatch)
+        shell: bash
+        run: |
+          cd kernel_workspace
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+
+          if [ "${{ matrix.build_tool }}" = "bazel" ] || { [ "${{ matrix.build_tool }}" = "auto" ] && [ -x tools/bazel ]; }; then
+            echo "[+] Building ${{ matrix.kernel_version }} with Kleaf / Bazel (page_size=${{ inputs.page_size }})..."
+            if [ "${{ inputs.page_size }}" = "16k" ] && grep -qs '"kernel_aarch64_16k"' common/BUILD.bazel build/kernel/kleaf/common_kernels.bzl; then
+              BAZEL_TARGET="//common:kernel_aarch64_16k_dist"
+            else
+              BAZEL_TARGET="//common:kernel_aarch64_dist"
+            fi
+            tools/bazel run --config=fast --verbose_failures "${BAZEL_TARGET}" -- --dist_dir="$GITHUB_WORKSPACE/kernel_workspace/out/dist"
+          else
+            echo "[+] Building ${{ matrix.kernel_version }} with legacy build/build.sh + ccache..."
+            export CCACHE_DIR="$HOME/.cache/ccache"
+            export USE_CCACHE=1
+            ccache -M 12G || true
+            LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 DIST_DIR="$GITHUB_WORKSPACE/kernel_workspace/out/dist" build/build.sh
+          fi
+
+      - name: Build & Package Mosey wonder KSU Module (out-of-tree `.ko`)
+        id: mosey
+        if: ${{ inputs.mosey_mode != 'disabled' }}
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}/kernel_workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/mosey_src"
+          OBJ="$RUNNER_TEMP/mosey_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
+
+          cfg=""
+          for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do
+            [ -f "$c" ] && { cfg="$c"; break; }
+          done
+          [ -n "$cfg" ] || cfg="$(find bazel-bin/common out -maxdepth 4 -name .config -type f 2>/dev/null | head -n1 || true)"
+          img=""
+          for i in out/dist/Image bazel-bin/common/kernel_aarch64/Image; do
+            [ -f "$i" ] && { img="$i"; break; }
+          done
+          [ -n "$img" ] || img="$(find . -maxdepth 5 -type f -name Image 2>/dev/null | head -n1 || true)"
+          if [ -z "$cfg" ] || [ -z "$img" ]; then
+            echo "::warning::Mosey: no .config/Image found for this family, skipping module (kernel zip unaffected)"
+            exit 0
+          fi
+
+          krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"
+          [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
+
+          clang_ver="$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null | head -n1 || true)"
+          clang_bin="$(sed -n 's/^CLANG_PREBUILT_BIN=//p' common/build.config.common 2>/dev/null | head -n1 || true)"
+          clang_bin="${clang_bin//\$\{CLANG_VERSION\}/$clang_ver}"
+          if [ ! -x "$clang_bin/clang" ] && [ -n "$clang_ver" ]; then
+            clang_bin="prebuilts/clang/host/linux-x86/clang-${clang_ver}/bin"
+          fi
+          if [ ! -x "$clang_bin/clang" ]; then
+            clang_bin="$(find prebuilts*/clang/host/linux-x86 -maxdepth 2 -path '*/clang-r*/bin' -type d 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          if [ -z "$clang_bin" ] || [ ! -x "$clang_bin/clang" ]; then
+            echo "::warning::Mosey: no prebuilt clang found, skipping module (kernel zip unaffected)"
+            exit 0
+          fi
+          export PATH="$PWD/$clang_bin:$PATH"
+
+          cp "$cfg" "$OBJ/.config"
+          [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
+
+          mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+              LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)")
+          "${mk[@]}" olddefconfig
+          "${mk[@]}" modules_prepare
+          echo "$krel" > "$OBJ/include/config/kernel.release"
+          printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
+
+          sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
+          if [ -n "$sv" ]; then cp "$sv" "$OBJ/Module.symvers"; else echo "::warning::Mosey: no symvers, core symbols unversioned"; fi
+
+          "${mk[@]}" M="$SRC" KBUILD_MODPOST_WARN=1 modules
+          ko="$SRC/wonder_mosey_wild.ko"
+          llvm-strip --strip-debug "$ko" || true
+          vermagic="$(modinfo -F vermagic "$ko" 2>/dev/null || echo '?')"
+          echo "[+] built wonder_mosey_wild.ko  vermagic: $vermagic"
+          case "$vermagic" in
+            "$krel "*) ;;
+            *) echo "::warning::Mosey: vermagic '$vermagic' does not start with $krel" ;;
+          esac
+
+          ENABLER="$GITHUB_WORKSPACE/mosey/enabler"
+          PKG="$GITHUB_WORKSPACE/mosey_wonder/pkg"
+          rm -rf "$GITHUB_WORKSPACE/mosey_wonder"; mkdir -p "$PKG"
+          if [ -d "$ENABLER" ]; then
+            echo "[+] Baking wonder_mosey_wild.ko into the full Mosey enabler module"
+            cp -a "$ENABLER/." "$PKG/"
+            rm -f "$PKG/NOTICE-wonder.md"
+            MODNAME="Mosey-enabler"
+            if [ -f "$ENABLER/blobs.manifest" ]; then
+              MOSEY_SHIM_BASE="${{ vars.MOSEY_SHIM_BASE }}" bash "$GITHUB_WORKSPACE/tools/fetch-blobs.sh" "$ENABLER/blobs.manifest" "$PKG" \
+                || echo "::warning::Mosey enabler: blob fetch reported errors; the shim may be absent from the zip. Set the MOSEY_SHIM_BASE repo variable to where you host the GPLv2 shim APKs."
+              rm -f "$PKG/blobs.manifest"
+            fi
+            for a in system_ext/priv-app/MoseyBridgeShim/MoseyBridgeShim.apk payload/MoseyBridgeShim.apk; do
+              [ -s "$PKG/$a" ] || echo "::warning::Mosey enabler: $a missing from the zip - fetch-blobs couldn't place it (check the MOSEY_SHIM_BASE repo variable and the manifest URLs). customize.sh will flag it on-device."
+            done
+          else
+            echo "[+] No mosey/enabler in repo; shipping the minimal wonder loader module"
+            mkdir -p "$PKG/META-INF/com/google/android"
+            cat > "$PKG/module.prop" <<'PROP_EOF'
+          id=mosey_wonder
+          name=Mosey wonder phy
+          version=@KREL@
+          versionCode=@VCODE@
+          author=@Dev_DcS
+          description=Loads wonder_mosey_wild.ko so mosey-extended gets its 'wonder' phy. Only loads on the kernel it was built with: @KREL@
+          PROP_EOF
+            cat > "$PKG/post-fs-data.sh" <<'PFD_EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          LOG="$MODDIR/wonder.log"
+
+          [ -d /sys/module/wonder_mosey_wild ] && exit 0
+
+          (
+            i=0
+            while [ ! -d /sys/module/cfg80211 ] && [ "$i" -lt 120 ]; do
+              sleep 1
+              i=$((i + 1))
+            done
+            if [ ! -d /sys/module/cfg80211 ]; then
+              echo "cfg80211 never showed up after ${i}s, not loading" > "$LOG"
+              exit 0
+            fi
+            KO="$MODDIR/wonder_mosey_wild.ko"
+            if [ -s "$MODDIR/mac_addr" ]; then
+              set -- "$KO" "mac_addr=$(head -n1 "$MODDIR/mac_addr")"
+            else
+              set -- "$KO"
+            fi
+            if insmod "$@" > "$LOG" 2>&1; then
+              echo "loaded after ${i}s on $(uname -r)" >> "$LOG"
+            else
+              echo "insmod failed on $(uname -r), see dmesg | grep wonder" >> "$LOG"
+            fi
+          ) &
+          PFD_EOF
+            cat > "$PKG/customize.sh" <<'CUST_EOF'
+          BUILT_FOR="@KREL@"
+          RUNNING="$(uname -r)"
+
+          ui_print "- wonder_mosey_wild for $BUILT_FOR"
+          if [ "$RUNNING" != "$BUILT_FOR" ]; then
+            ui_print "! Running kernel is $RUNNING"
+            ui_print "! The module will very likely be refused until you"
+            ui_print "! flash the matching Wild kernel from the same run."
+          fi
+          if [ ! -d /sys/module/cfg80211 ]; then
+            ui_print "! cfg80211 isn't loaded right now. It normally comes"
+            ui_print "! with the Wi-Fi driver, the phy loads once it is."
+          fi
+          ui_print "- MAC: $(head -n1 "$MODPATH/mac_addr" 2>/dev/null)"
+          ui_print "  change it in /data/adb/modules/mosey_wonder/mac_addr"
+          CUST_EOF
+            cat > "$PKG/META-INF/com/google/android/update-binary" <<'UB_EOF'
+          #!/sbin/sh
+
+          umask 022
+
+          ui_print() { echo "$1"; }
+
+          # read by util_functions.sh's install_module
+          # shellcheck disable=SC2034
+          OUTFD=$2
+          # shellcheck disable=SC2034
+          ZIPFILE=$3
+
+          mount /data 2>/dev/null
+
+          if [ ! -f /data/adb/magisk/util_functions.sh ]; then
+            ui_print "Install this from the KernelSU or Magisk app."
+            exit 1
+          fi
+          . /data/adb/magisk/util_functions.sh
+          install_module
+          exit 0
+          UB_EOF
+            echo '#MAGISK' > "$PKG/META-INF/com/google/android/updater-script"
+            sed -i -e "s|@KREL@|$krel|g" -e "s|@VCODE@|${GITHUB_RUN_NUMBER}|g" "$PKG/module.prop" "$PKG/customize.sh"
+            MODNAME="Mosey-wonder"
+          fi
+
+          cp "$ko" "$PKG/wonder_mosey_wild.ko"
+          echo "${{ inputs.mosey_mac_addr }}" > "$PKG/mac_addr"
+          for s in post-fs-data.sh wonder-load.sh service.sh post-mount.sh boot-completed.sh                    customize.sh uninstall.sh action.sh mosey-control.sh                    META-INF/com/google/android/update-binary; do
+            [ -f "$PKG/$s" ] && chmod 0755 "$PKG/$s"
+          done
+
+          ZIP="$GITHUB_WORKSPACE/${krel}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-${MODNAME}.zip"
+          (cd "$PKG" && zip -qr9 "$ZIP" .)
+          echo "built=1" >> "$GITHUB_OUTPUT"
+          unzip -l "$ZIP" | tail -25
+
+      - name: Upload Mosey module
+        if: ${{ inputs.mosey_mode != 'disabled' && steps.mosey.outputs.built == '1' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey"
+          path: |
+            *-Mosey-enabler.zip
+            *-Mosey-wonder.zip
+          if-no-files-found: ignore
+
+      - name: Package Flashable AnyKernel3 Archive & BuildInfo
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git AnyKernel3 || \
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+
+          if [ -f kernel_workspace/out/dist/Image ]; then
+            cp -f kernel_workspace/out/dist/Image AnyKernel3/Image
+          elif [ -f kernel_workspace/bazel-bin/common/kernel_aarch64/Image ]; then
+            cp -f kernel_workspace/bazel-bin/common/kernel_aarch64/Image AnyKernel3/Image
+          else
+            FOUND_IMG=$(find kernel_workspace -type f -name "Image" | head -n 1 || true)
+            if [ -n "$FOUND_IMG" ]; then
+              cp -f "$FOUND_IMG" AnyKernel3/Image
+            fi
+          fi
+
+          if [ ! -f AnyKernel3/Image ]; then
+            echo "[-] Error: Compiled kernel Image not found!"
+            exit 1
+          fi
+
+          KVER_FULL="${{ steps.sync-kernel.outputs.resolved_kver }}"
+          ZIP_NAME="${KVER_FULL}-${{ matrix.kernel_version }}-lts-${{ matrix.root_variant }}-Mosey-AnyKernel3.zip"
+          (cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .)
+
+          cat << EOF > BuildInfo.txt
+          Kernel Family: ${{ matrix.kernel_version }}
+          Resolved Kernel Version: ${KVER_FULL}
+          Page Size: ${{ inputs.page_size }}
+          Manifest Branch: ${{ matrix.manifest_branch }}
+          SUSFS Branch: ${{ matrix.susfs_branch }} (Enabled: ${{ inputs.enable_susfs }})
+          Root Implementation: ${{ matrix.root_variant }}
+          Metamodule: ${{ inputs.metamodule }}
+          Baseband Guard (BBG): ${{ inputs.enable_bbg }}
+          Networking Suite: ${{ inputs.enable_networking }}
+          Extended BPF/BTF: ${{ inputs.enable_bpf }}
+          NTSync (/dev/ntsync): ${{ inputs.enable_ntsync }}
+          DroidSpaces-OSS: ${{ inputs.enable_droidspaces }}
+          Mosey Extended Mode: ${{ inputs.mosey_mode }} (MAC: ${{ inputs.mosey_mac_addr }})
+          NLMON Capture: ${{ inputs.enable_nlmon }}
+          Module Check Bypass: ${{ inputs.allow_version_mismatch }}
+          EOF
+
+      - name: Upload AnyKernel3 ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey-AnyKernel3"
+          path: "*-AnyKernel3.zip"
+
+      - name: Upload BuildInfo & Mosey Companion Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Mosey-BuildInfo"
+          path: |
+            BuildInfo.txt
+            mosey_out/*
+
+      - name: Fetch matching root manager APK (${{ matrix.root_variant }})
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p managers
+          case "${{ matrix.root_variant }}" in
+            RKSU)    MGR_REPO="rsuntk/KernelSU" ;;
+            xxksu)   MGR_REPO="backslashxx/KernelSU" ;;
+            HyperSU) MGR_REPO="HyperSU-Team/HyperSU" ;;
+            *)       MGR_REPO="" ;;
+          esac
+          if [ -z "$MGR_REPO" ]; then
+            echo "[i] ${{ matrix.root_variant }}: no manager app to fetch"
+            exit 0
+          fi
+          echo "[+] Fetching manager APK from $MGR_REPO (latest release)..."
+          if gh release download --repo "$MGR_REPO" --pattern '*.apk' --dir managers 2>/dev/null; then
+            echo "[+] manager APK(s): $(ls managers 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::no .apk in $MGR_REPO latest release (or repo unavailable); install the $MGR_REPO manager by hand"
+          fi
+
+      - name: Upload Root Manager APK
+        if: hashFiles('managers/*.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-Manager"
+          path: managers/*.apk
+
+      - name: Fetch metamodule
+        if: ${{ inputs.ship_metamodule == true && inputs.metamodule != 'none' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p metamodule_out
+          case "${{ inputs.metamodule }}" in
+            NoMount)        META_REPO="maxsteeel/nomount" ;;
+            ZeroMount)      META_REPO="Enginex0/zeromount" ;;
+            Mountify)       META_REPO="backslashxx/mountify" ;;
+            Hybrid)         META_REPO="Hybrid-Mount/meta-hybrid_mount" ;;
+            Magic-Mount-rs) META_REPO="Tools-cx-app/meta-magic_mount-rs" ;;
+            *)              META_REPO="" ;;
+          esac
+          [ -z "$META_REPO" ] && { echo "[i] no metamodule to fetch"; exit 0; }
+          echo "[+] Fetching ${{ inputs.metamodule }} module ($META_REPO, latest release)..."
+          if gh release download --repo "$META_REPO" --pattern '*.zip' --dir metamodule_out 2>/dev/null; then
+            echo "[+] metamodule zip(s): $(ls metamodule_out 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::could not fetch $META_REPO (no zip asset or repo unavailable); install the metamodule by hand"
+          fi
+
+      - name: Upload metamodule
+        if: ${{ inputs.ship_metamodule == true && hashFiles('metamodule_out/*') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ steps.sync-kernel.outputs.resolved_kver }}-${{ matrix.kernel_version }}-${{ matrix.root_variant }}-${{ inputs.metamodule }}"
+          path: metamodule_out/*

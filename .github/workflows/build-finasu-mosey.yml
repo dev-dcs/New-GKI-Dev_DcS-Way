@@ -18,9 +18,9 @@ on:
           - all
         default: android16-6.12
       gki_lts_version:
-        description: "Sublevel: 'LTS' (tip of the branch picked for the family) or the last digits of an older one, e.g. 150"
+        description: "Sublevel: 'All' builds every released sublevel on the family's KMI generation, 'LTS' just the branch tip, or the last digits of a specific one (e.g. 150)"
         type: string
-        default: "LTS"
+        default: "All"
       kmi_generation:
         description: "KMI generation of the phone's stock kernel = the number after 'androidNN-' in `uname -r` (6.12.81-android16-6-g... is 6). 'auto' = the one Google's newest release branch is on. A kernel of another generation bootloops."
         type: string
@@ -328,11 +328,84 @@ jobs:
                   return f'{fam["kver"]}.{int(req_lts.rsplit(".", 1)[1])}'
               return None
 
-          if req_lts and req_lts.upper() != "LTS" and not any(requested(f) for f in selected):
+          req_all = req_lts.upper() == "ALL"
+
+          def wanted_gen(fam):
+              """The -lts branch info, the family's dated release branches (newest
+              first), and the KMI generation we build for (req_kmi, or the newest
+              Google has)."""
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+              if req_kmi.isdigit():
+                  gen = int(req_kmi)
+              else:
+                  gen = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if gen is None and lts:
+                      gen = lts["kmi"]
+              return lts, dated, gen
+
+          def list_sources(fam):
+              """Every distinct sublevel to build for 'All': the -lts tip (when it is
+              on the wanted generation) plus each dated release branch on it, newest
+              first, deduped by version. A gen-7 kernel on a gen-6 phone bootloops,
+              so nothing off the wanted generation is ever added."""
+              lts, dated, gen = wanted_gen(fam)
+              on_gen, seen_gen = [], False
+              for b in dated:
+                  i = branch_info(b)
+                  if not i or not i["kmi"]:
+                      if seen_gen:
+                          break
+                      continue
+                  if i["kmi"] < gen:
+                      break
+                  if i["kmi"] == gen:
+                      seen_gen = True
+                      on_gen.append(i)
+              out, seen = [], set()
+              if lts and lts["kmi"] == gen:
+                  out.append(dict(lts, ref=on_gen[0]["branch"] if on_gen else "", ref_exact="false"))
+                  seen.add(lts["version"])
+              for i in on_gen:
+                  if i["version"] in seen:
+                      continue
+                  out.append(dict(i, ref=i["branch"], ref_exact="true"))
+                  seen.add(i["version"])
+              return out, gen
+
+          if not req_all and req_lts and req_lts.upper() != "LTS" and not any(requested(f) for f in selected):
               print(f"::warning::gki_lts_version '{req_lts}' is not a sublevel of the selected family; building the branch tip instead")
 
           include = []
           for fam in selected:
+              if req_all:
+                  srcs, gen = list_sources(fam)
+                  if not srcs:
+                      print(f"::error::{fam['kernel_version']}: found no branch on KMI generation {gen} to build. Nothing built - run it again.")
+                      sys.exit(1)
+                  built = []
+                  for src in srcs:
+                      entry = dict(fam)
+                      entry["manifest_branch"] = src["manifest"]
+                      entry["gki_branch"] = src["branch"]
+                      entry["kmi_generation"] = str(src["kmi"] or "")
+                      entry["kmi_ref_branch"] = src["ref"]
+                      entry["kmi_ref_exact"] = src["ref_exact"]
+                      entry["lts_version"] = src["version"] or f'{fam["kver"]}-LTS'
+                      entry["follow_tip"] = "true" if src["ref_exact"] == "false" else "false"
+                      for r in roots:
+                          e = dict(entry)
+                          e["root_variant"] = r
+                          include.append(e)
+                      built.append(src["version"] or "tip")
+                  print(f"[i] {fam['kernel_version']}: building all {len(srcs)} sublevel(s) on KMI {gen}: {', '.join(built)}")
+                  continue
               entry = dict(fam)
               want = requested(fam)
               src = pick_branch(fam, req_kmi, want) or pick_branch(fam, "auto", want)
@@ -361,6 +434,10 @@ jobs:
                   e = dict(entry)
                   e["root_variant"] = r
                   include.append(e)
+
+          if len(include) > 256:
+              print(f"::error::this selection makes {len(include)} jobs and GitHub caps a matrix at 256. Narrow it: one family, 'LTS' or a single sublevel, or fewer root variants.")
+              sys.exit(1)
 
           matrix_json = json.dumps({"include": include})
           print("Generated matrix:", matrix_json)
@@ -1799,8 +1876,13 @@ jobs:
             cp -a "$ENABLER/." "$PKG/"
             rm -f "$PKG/NOTICE-wonder.md"
             MODNAME="Mosey-enabler"
+            if [ -f "$ENABLER/blobs.manifest" ]; then
+              MOSEY_SHIM_BASE="${{ vars.MOSEY_SHIM_BASE }}" bash "$GITHUB_WORKSPACE/tools/fetch-blobs.sh" "$ENABLER/blobs.manifest" "$PKG" \
+                || echo "::warning::Mosey enabler: blob fetch reported errors; the shim may be absent from the zip. Set the MOSEY_SHIM_BASE repo variable to where you host the GPLv2 shim APKs."
+              rm -f "$PKG/blobs.manifest"
+            fi
             for a in system_ext/priv-app/MoseyBridgeShim/MoseyBridgeShim.apk payload/MoseyBridgeShim.apk; do
-              [ -s "$PKG/$a" ] || echo "::warning::Mosey enabler: $a is not in the repo checkout, so it won't be in the zip and customize.sh will flag it missing on-device. Commit the APK under mosey/enabler/ (it isn't .gitignored, but binaries have to be pushed)."
+              [ -s "$PKG/$a" ] || echo "::warning::Mosey enabler: $a missing from the zip - fetch-blobs couldn't place it (check the MOSEY_SHIM_BASE repo variable and the manifest URLs). customize.sh will flag it on-device."
             done
           else
             echo "[+] No mosey/enabler in repo; shipping the minimal wonder loader module"

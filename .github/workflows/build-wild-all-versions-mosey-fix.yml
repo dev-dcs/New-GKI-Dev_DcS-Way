@@ -7,7 +7,6 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      # --- Core Kernel & Matrix Selection (All WildKernels Families) ---
       kernel_build_version:
         description: "Kernel Version Family (select 'all' to build 6.1 / 6.6 / 6.12 in parallel)"
         type: choice
@@ -18,9 +17,9 @@ on:
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "Specific LTS Subversion (e.g. 6.6.144, 6.1.145, 6.12.92) or leave blank for latest LTS"
+        description: "Sublevel: 'All' builds every released sublevel on the family's KMI generation, 'LTS' just the branch tip, or the last digits of a specific one (e.g. 150)"
         type: string
-        default: "6.6.144"
+        default: "All"
       kernel_name:
         description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
         type: string
@@ -69,7 +68,6 @@ on:
         type: boolean
         default: false
 
-      # --- Regular WildKernels Feature Set Toggles ---
       enable_susfs:
         description: "Enable SUSFS for KernelSU (auto-selects per-kernel gki-android*-* branch + Ptrace/Unicode fixes)"
         type: boolean
@@ -119,7 +117,6 @@ on:
         type: boolean
         default: true
 
-      # --- Mosey Extended (AirDrop / Quick Share) Options ---
       mosey_mode:
         description: "Mosey Extended (wonder_mosey_wild) Driver Integration Mode"
         type: choice
@@ -139,9 +136,6 @@ on:
         default: true
 
 jobs:
-  # ============================================================================
-  # JOB 1: Generate Multi-Version Build Matrix (5.10 -> 6.12 + Root Variants)
-  # ============================================================================
   generate-matrix:
     name: "Resolve Kernel & Root Matrix"
     runs-on: ubuntu-latest
@@ -157,63 +151,268 @@ jobs:
         shell: bash
         run: |
           python3 - << 'EOF'
+          import base64
           import json
           import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
 
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
+          req_kmi = "auto"
           req_root = "${{ inputs.root_variant }}"
-
-          all_families = [
-              {
-                  "kernel_version": "android14-6.1",
-                  "kver": "6.1",
-                  "manifest_branch": "common-android14-6.1-lts",
-                  "susfs_branch": "gki-android14-6.1",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android15-6.6",
-                  "kver": "6.6",
-                  "manifest_branch": "common-android15-6.6-lts",
-                  "susfs_branch": "gki-android15-6.6",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android16-6.12",
-                  "kver": "6.12",
-                  "manifest_branch": "common-android16-6.12-lts",
-                  "susfs_branch": "gki-android16-6.12",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-          ]
-
-          if req_family == "all":
-              selected_families = all_families
-          else:
-              selected_families = [f for f in all_families if f["kernel_version"] == req_family]
-
           if req_root == "All":
               roots = ["KernelSU-Next", "KernelSU", "BakaSU"]
           else:
               roots = [req_root]
 
+          all_families = [
+              {"kernel_version": "android14-6.1",  "kver": "6.1",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android15-6.6",  "kver": "6.6",  "susfs_branch": "gki-android15-6.6",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android16-6.12", "kver": "6.12", "susfs_branch": "gki-android16-6.12", "cache_type": "bazel", "build_tool": "bazel"},
+          ]
+
+          selected = all_families if req_family == "all" else [f for f in all_families if f["kernel_version"] == req_family]
+
+          if req_kmi != "auto" and not req_kmi.isdigit():
+              print(f"::error::kmi_generation is '{req_kmi}': use 'auto' or the number from `uname -r` (…-android16-6-… is 6)")
+              sys.exit(1)
+
+          GOOGLE = "https://android.googlesource.com"
+
+          def fetch(url):
+              for attempt in (1, 2, 3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as r:
+                          return r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404 or attempt == 3:
+                          raise
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                  time.sleep(2 * attempt)
+
+          def gitiles(repo, ref, path):
+              return base64.b64decode(fetch(f"{GOOGLE}/{repo}/+/refs/heads/{ref}/{path}?format=TEXT")).decode("utf-8", "replace")
+
+          def manifest_branches():
+              return list(json.loads(fetch(f"{GOOGLE}/kernel/manifest/+refs/heads?format=JSON").decode().split("\n", 1)[1]))
+
+          _seen = {}
+          def branch_info(manifest_branch):
+              """Version and KMI generation at the tip of what a manifest syncs, or None."""
+              if manifest_branch not in _seen:
+                  try:
+                      manifest = gitiles("kernel/manifest", manifest_branch, "default.xml")
+                      proj = re.search(r'<project[^>]*path="common"[^>]*>', manifest)
+                      rev = re.search(r'revision="([^"]+)"', proj.group(0)) if proj else None
+                      rev = (rev or re.search(r'<default[^>]*revision="([^"]+)"', manifest)).group(1)
+                      makefile = gitiles("kernel/common", rev, "Makefile")
+                      version = ".".join(re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
+                                         for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL"))
+                      kmi = None
+                      for f in ("build.config.constants", "build.config.common"):
+                          try:
+                              m = re.search(r"^KMI_GENERATION=(\d+)", gitiles("kernel/common", rev, f), re.M)
+                          except Exception:
+                              m = None
+                          if m:
+                              kmi = int(m.group(1))
+                              break
+                      _seen[manifest_branch] = {"manifest": manifest_branch, "branch": rev, "version": version, "kmi": kmi}
+                  except Exception:
+                      _seen[manifest_branch] = None
+              return _seen[manifest_branch]
+
+          def pick_branch(fam, kmi, asked):
+              """Which of Google's branches to build for this family.
+
+              kmi is 'auto' or a generation number, asked is a full x.y.z or None.
+
+              The phone's drivers are built for one KMI generation and only load on a
+              kernel of that same generation. The -lts branch moves on to the next one
+              before any phone does: 6.12 -lts went to 7 while every release Google has
+              cut, and with it the Pixel 10, is on 6 - and a generation-7 kernel on
+              that phone is a bootloop. So "newest code" and "boots" are not always the
+              same branch: take -lts while it is on the wanted generation, otherwise
+              the newest dated release branch that is.
+              """
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+
+              def releases(gen):
+                  seen_one = False
+                  for b in dated:
+                      i = branch_info(b)
+                      if not i or not i["kmi"]:
+                          if seen_one:
+                              return
+                          continue
+                      seen_one = True
+                      if i["kmi"] < gen:
+                          return
+                      if i["kmi"] == gen:
+                          yield i
+
+              if kmi.isdigit():
+                  want = int(kmi)
+              else:
+                  want = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if want is None and lts:
+                      want = lts["kmi"]
+              if want is None:
+                  print(f"::error::{name}: could not read Google's branches to work out the KMI generation. "
+                        f"Nothing built - run it again.")
+                  sys.exit(1)
+
+              if lts and lts["kmi"] == want:
+                  ref = next(releases(want), None)
+                  return dict(lts, ref=ref["branch"] if ref else "", ref_exact="false")
+
+              src = None
+              if asked:
+                  src = next((i for i in releases(want) if i["version"] == asked), None)
+              src = src or next(releases(want), None)
+              if src:
+                  print(f"[i] {name}: -lts is on KMI generation {lts['kmi'] if lts else '?'}, "
+                        f"building {src['branch']} ({src['version']}) which is on {want}")
+                  return dict(src, ref=src["branch"], ref_exact="true")
+
+              have = sorted({i["kmi"] for i in map(branch_info, dated[:6]) if i and i["kmi"]} | ({lts["kmi"]} if lts else set()))
+              msg = f"{name}: no branch on KMI generation {want} (Google has {', '.join(map(str, have)) or 'none readable'})."
+              if len(selected) == 1 or not kmi.isdigit():
+                  print(f"::error::{msg}")
+                  sys.exit(1)
+              print(f"::warning::{msg} Using 'auto' for this family.")
+              return None
+
+          def requested(fam):
+              if req_lts.isdigit():
+                  return f'{fam["kver"]}.{int(req_lts)}'
+              if re.fullmatch(re.escape(fam["kver"]) + r"\.\d+", req_lts):
+                  return f'{fam["kver"]}.{int(req_lts.rsplit(".", 1)[1])}'
+              return None
+
+          req_all = req_lts.upper() == "ALL"
+
+          def wanted_gen(fam):
+              """The -lts branch info, the family's dated release branches (newest
+              first), and the KMI generation we build for (req_kmi, or the newest
+              Google has)."""
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+              if req_kmi.isdigit():
+                  gen = int(req_kmi)
+              else:
+                  gen = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if gen is None and lts:
+                      gen = lts["kmi"]
+              return lts, dated, gen
+
+          def list_sources(fam):
+              """Every distinct sublevel to build for 'All': the -lts tip (when it is
+              on the wanted generation) plus each dated release branch on it, newest
+              first, deduped by version. A gen-7 kernel on a gen-6 phone bootloops,
+              so nothing off the wanted generation is ever added."""
+              lts, dated, gen = wanted_gen(fam)
+              on_gen, seen_gen = [], False
+              for b in dated:
+                  i = branch_info(b)
+                  if not i or not i["kmi"]:
+                      if seen_gen:
+                          break
+                      continue
+                  if i["kmi"] < gen:
+                      break
+                  if i["kmi"] == gen:
+                      seen_gen = True
+                      on_gen.append(i)
+              out, seen = [], set()
+              if lts and lts["kmi"] == gen:
+                  out.append(dict(lts, ref=on_gen[0]["branch"] if on_gen else "", ref_exact="false"))
+                  seen.add(lts["version"])
+              for i in on_gen:
+                  if i["version"] in seen:
+                      continue
+                  out.append(dict(i, ref=i["branch"], ref_exact="true"))
+                  seen.add(i["version"])
+              return out, gen
+
+          if not req_all and req_lts and req_lts.upper() != "LTS" and not any(requested(f) for f in selected):
+              print(f"::warning::gki_lts_version '{req_lts}' is not a sublevel of the selected family; building the branch tip instead")
+
           include = []
-          for fam in selected_families:
-              lts_val = "lts"
-              if req_lts:
-                  if req_lts.startswith(fam["kver"] + "."):
-                      lts_val = req_lts
-                  elif req_family != "all":
-                      lts_val = req_lts
+          for fam in selected:
+              if req_all:
+                  srcs, gen = list_sources(fam)
+                  if not srcs:
+                      print(f"::error::{fam['kernel_version']}: found no branch on KMI generation {gen} to build. Nothing built - run it again.")
+                      sys.exit(1)
+                  built = []
+                  for src in srcs:
+                      entry = dict(fam)
+                      entry["manifest_branch"] = src["manifest"]
+                      entry["gki_branch"] = src["branch"]
+                      entry["kmi_generation"] = str(src["kmi"] or "")
+                      entry["kmi_ref_branch"] = src["ref"]
+                      entry["kmi_ref_exact"] = src["ref_exact"]
+                      entry["lts_version"] = src["version"] or f'{fam["kver"]}-LTS'
+                      entry["follow_tip"] = "true" if src["ref_exact"] == "false" else "false"
+                      for r in roots:
+                          e = dict(entry)
+                          e["root_variant"] = r
+                          include.append(e)
+                      built.append(src["version"] or "tip")
+                  print(f"[i] {fam['kernel_version']}: building all {len(srcs)} sublevel(s) on KMI {gen}: {', '.join(built)}")
+                  continue
+              entry = dict(fam)
+              want = requested(fam)
+              src = pick_branch(fam, req_kmi, want) or pick_branch(fam, "auto", want)
+              entry["manifest_branch"] = src["manifest"]
+              entry["gki_branch"] = src["branch"]
+              entry["kmi_generation"] = str(src["kmi"] or "")
+              entry["kmi_ref_branch"] = src["ref"]
+              entry["kmi_ref_exact"] = src["ref_exact"]
+              tip = src["version"]
+              if want == tip:
+                  want = None
+              if want and tip and int(want.rsplit(".", 1)[1]) > int(tip.rsplit(".", 1)[1]):
+                  msg = f"{want} does not exist on {src['branch']}, which is at {tip}."
+                  if len(selected) == 1:
+                      print(f"::error::{msg} Use 'LTS' or a sublevel up to {tip.rsplit('.', 1)[1]}.")
+                      sys.exit(1)
+                  print(f"::warning::{msg} Building {tip} for this family.")
+                  want = None
+              if want:
+                  entry["lts_version"] = want
+                  entry["follow_tip"] = "false"
+              else:
+                  entry["lts_version"] = tip or f'{fam["kver"]}-LTS'
+                  entry["follow_tip"] = "true"
               for r in roots:
-                  entry = dict(fam)
-                  entry["lts_version"] = lts_val
-                  entry["root_variant"] = r
-                  include.append(entry)
+                  e = dict(entry)
+                  e["root_variant"] = r
+                  include.append(e)
+
+          if len(include) > 256:
+              print(f"::error::this selection makes {len(include)} jobs and GitHub caps a matrix at 256. Narrow it: one family, 'LTS' or a single sublevel, or fewer root variants.")
+              sys.exit(1)
 
           matrix_json = json.dumps({"include": include})
           print("Generated matrix:", matrix_json)
@@ -221,9 +420,6 @@ jobs:
               out.write(f"matrix={matrix_json}\n")
           EOF
 
-  # ============================================================================
-  # JOB 2: WildKernels Fork Pipeline Mode (All Versions via .github/actions)
-  # ============================================================================
   build-fork-pipeline:
     name: "Fork Pipeline: ${{ matrix.kernel_version }} (${{ matrix.lts_version }})"
     needs: generate-matrix
@@ -293,9 +489,6 @@ jobs:
           page_size: ${{ inputs.page_size }}
           allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
 
-  # ============================================================================
-  # JOB 3: Standalone Multi-Version Builder (5.10, 5.15, 6.1, 6.6, 6.12 + Mosey)
-  # ============================================================================
   build-all-versions-mosey:
     name: "Build ${{ matrix.kernel_version }} (${{ matrix.lts_version }} | ${{ matrix.root_variant }} + Mosey)"
     needs: generate-matrix
@@ -366,8 +559,6 @@ jobs:
                 echo "[+] Checking out exact commit for Linux ${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL}: $MATCH_COMMIT"
                 git checkout "$MATCH_COMMIT"
               else
-                # not in this branch: build the tip under its real number rather
-                # than rewrite the Makefile to a version the source isn't
                 echo "::warning::${VERSION}.${PATCHLEVEL}.${TARGET_SUBLEVEL} is not in this branch - building the tip, ${VERSION}.${PATCHLEVEL}.${CURRENT_SUBLEVEL}"
                 TARGET_SUBLEVEL="$CURRENT_SUBLEVEL"
               fi
@@ -460,12 +651,6 @@ jobs:
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVERS_DIR/Kconfig"
           fi
 
-          # FinaSU manager trust: bake the CURRENT FinaSU manager's signing cert
-          # as the auto-trusted slot. Without this, FinaSU's dynamic-manager
-          # default trusts only weishu's KernelSU app and the FinaSU manager
-          # shows "Not installed". We compute the signature from the actual
-          # latest manager APK so it tracks FinaSU updates (v1.4.4+), and fall
-          # back to the known v1.4.x cert if the fetch/compute can't run.
           if [ "${{ matrix.root_variant }}" = "FinaSU" ] && [ -f "$ROOT_DIR/kernel/Kbuild" ]; then
             FINA_SZ="0x02cc"
             FINA_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
@@ -500,20 +685,11 @@ jobs:
           KVER_SHORT="${{ matrix.kver }}"
           SUBLEVEL="${{ steps.sync-kernel.outputs.resolved_sublevel }}"
 
-          # 1. SUSFS + Root Compat + Ptrace/Unicode Fixes
           if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "${{ matrix.root_variant }}" != "KowSU" ] && [ -d "$SUSFS_DIR/kernel_patches" ]; then
             echo "[+] Copying SUSFS fs/ and include/linux/ sources..."
             cp -rf "$SUSFS_DIR/kernel_patches/fs/"* common/fs/ || true
             cp -rf "$SUSFS_DIR/kernel_patches/include/linux/"* common/include/linux/ || true
 
-            # Root-side susfs. Plain tiann KernelSU is the only one without susfs,
-            # so it's the only one that gets the 10_enable patch. Next (dev-susfs),
-            # BakaSU, ReSukiSU and FinaSU already carry susfs, so handing them
-            # 10_enable or the tiann-shaped drift-fix scripts just breaks them -
-            # that's what blew up FinaSU's core/init.c. They only need the
-            # kernel-side 50_add further down. BakaSU's the odd one: it wants a
-            # tiny file of global symbols the susfs patch expects, which the
-            # bakasu_compat script drops in if it's around.
             case "${{ matrix.root_variant }}" in
               KernelSU)
                 if [ -d "$SUSFS_DIR/kernel_patches/KernelSU" ]; then
@@ -537,19 +713,11 @@ jobs:
               [ -f "$p" ] && patch -p1 --forward --fuzz=3 < "$p" || true
             done
 
-            # SUSFS core owns the correct fs/notify/fdinfo.c changes for the
-            # current tree now that the perf step no longer double-patches it,
-            # so no fdinfo.c "restore" is needed - restoring stock would only
-            # delete SUSFS's SUS_KSTAT fdinfo spoofing.
 
-            # Ptrace leak fix needs include/linux/tracehook.h, gone after 5.17
-            # (on 6.x it half-applies into signal.c); gate it to 5.x.
             case "$KVER_SHORT" in
               5.10|5.15) [ -f "$PATCH_DIR/gki_ptrace.patch" ] && patch -p1 --forward --fuzz=3 < "$PATCH_DIR/gki_ptrace.patch" || true ;;
             esac
 
-            # utf8-norm bypass fix ships two variants split at 6.1; apply the
-            # matching one instead of letting both fight over the file.
             case "$KVER_SHORT" in
               5.10|5.15) U="$PATCH_DIR/common/unicode_bypass_fix_6.1-.patch" ;;
               *)         U="$PATCH_DIR/common/unicode_bypass_fix_6.1+.patch" ;;
@@ -561,16 +729,10 @@ jobs:
 
           find . \( -name "*.rej" -o -name "*.orig" \) -delete || true
 
-          # 2. Baseband Guard (BBG)
           if [ "${{ inputs.enable_bbg }}" = "true" ]; then
             echo "[+] Integrating Baseband Guard (BBG)..."
             curl -LSs https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
             find "$PATCH_DIR" -name "*bbg*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
-            # BBG's own Makefile bails ("BBG not enable in CONFIG_LSM") unless
-            # 'baseband_guard' is in CONFIG_LSM. setup.sh drops the source in but
-            # never touches the LSM list, so we add it ourselves - into the
-            # default in security/Kconfig (same thing WildKernels' bbg action
-            # does) and into any explicit CONFIG_LSM= in the defconfig.
             if [ -d security/baseband-guard ]; then
               sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
               DEF="arch/arm64/configs/gki_defconfig"
@@ -583,28 +745,15 @@ jobs:
             fi
           fi
 
-          # 2b. NV write guard (opt-in, default OFF). Protects the modem's
-          # irreplaceable nv_protected.bin (RF calibration / IMEI) from a torn
-          # or stray write - the classic way a Shannon efs ends up bricked.
-          # nv_normal.bin is left writable on purpose so the modem can still
-          # heal itself. Ships as a tiny LSM; only bites once it is in CONFIG_LSM.
           if [ "${{ inputs.nv_write_guard }}" = "true" ]; then
             echo "[+] Integrating NV write guard (nv_guard LSM)..."
             NVD="$GITHUB_WORKSPACE/kernel-patches/nv_guard"
-            # Copy the sources in rather than applying a context patch: the
-            # patch was cut against 6.6, and security/Kconfig + security/Makefile
-            # differ across 5.10..6.18, so `patch --fuzz` lands at the wrong
-            # offset on other trees (it corrupted security/Kconfig on 5.10).
-            # The .c/.Kconfig/.Makefile themselves are version-independent.
             if [ ! -f security/nv_guard/nv_guard.c ] && [ -f "$NVD/nv_guard.c" ]; then
               mkdir -p security/nv_guard
               cp "$NVD/nv_guard.c" "$NVD/Kconfig" "$NVD/Makefile" security/nv_guard/
               echo "[+] nv_guard sources copied into security/nv_guard/"
             fi
             if [ -f security/nv_guard/nv_guard.c ]; then
-              # Wire Kconfig/Makefile by anchor, idempotently - no diff to fuzz.
-              # keys/Kconfig is the first `source` inside the security menu on
-              # every GKI version, so inserting after it is always in-menu.
               grep -q 'security/nv_guard/Kconfig' security/Kconfig || \
                 sed -i 's#^source "security/keys/Kconfig"#&\nsource "security/nv_guard/Kconfig"#' security/Kconfig
               grep -q 'nv_guard/' security/Makefile || \
@@ -621,16 +770,6 @@ jobs:
             fi
           fi
 
-          # 2c. Security patch level.
-          #   monthly    - whatever the base sync pulled (latest tagged GKI/LTS).
-          #                That already IS the Android monthly CVE set, merged
-          #                and tested together upstream. Nothing extra to do.
-          #   latest-cve - also fast-forward this series' post-release stable
-          #                CVE fixes on top (git am --3way). Anything that does
-          #                not apply cleanly is ABORTED and logged, never fuzzed
-          #                in. Bleeding edge; may apply nothing if the base tag
-          #                is not reachable in the synced tree. See README.
-          #   none       - build the base exactly as pinned.
           case "${{ inputs.security_patches }}" in
             latest-cve)
               echo "[+] security_patches=latest-cve: topping up with post-release stable CVE fixes..."
@@ -641,11 +780,7 @@ jobs:
               OUTD="$GITHUB_WORKSPACE/cve-out"; mkdir -p "$OUTD"
               OKF="$OUTD/cve-applied.txt"; SKF="$OUTD/cve-skipped.txt"; : > "$OKF"; : > "$SKF"
               STABLE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git"
-              # The synced Android tree never carries upstream stable tags, so the
-              # base tag has to come from linux-stable too, or it's never found.
               if git fetch --no-tags --depth=400 "$STABLE" "linux-${SERIES}.y:refs/cve_tip" "refs/tags/v${KVER}:refs/tags/v${KVER}" 2>/dev/null; then
-                # The base must sit inside the fetched history, otherwise rev-list
-                # walks past it into commits the tree already has. Deepen until it does.
                 for d in 800 1600 3200; do
                   git merge-base --is-ancestor "v${KVER}" refs/cve_tip 2>/dev/null && break
                   git fetch --no-tags --deepen="$d" "$STABLE" "linux-${SERIES}.y:refs/cve_tip" 2>/dev/null || break
@@ -678,16 +813,9 @@ jobs:
               ;;
           esac
 
-          # 3. NTSync. drivers/misc/ntsync.c ships only on 6.12; every other
-          # family needs ntsync_base.patch to ADD it, plus a per-family compat
-          # patch that wires Kconfig/Makefile. The old `find -path "*6.6*"` only
-          # matched the compat patch (ntsync_base has no version in its name),
-          # so CONFIG_NTSYNC=y referenced a drivers/misc/ntsync.o whose source
-          # was never created -> "No rule to make target drivers/misc/ntsync.o".
           if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
             echo "[+] Applying NTSync for ${{ matrix.kernel_version }}..."
             NT="$PATCH_DIR/common/ntsync"
-            # 6.12 already carries ntsync.c/.h; drop them so base re-adds a known copy
             if [ "${{ matrix.kernel_version }}" = "android16-6.12" ]; then
               rm -f include/uapi/linux/ntsync.h drivers/misc/ntsync.c
             fi
@@ -700,26 +828,16 @@ jobs:
             if [ -f "$NT/ntsync_base.patch" ]; then patch -p1 --forward --fuzz=3 < "$NT/ntsync_base.patch" || true; else echo "::warning::NTSync: ntsync_base.patch not found"; fi
           fi
 
-          # 4. Networking (BBRv3 / Netfilter for matching kernel series)
           if [ "${{ inputs.enable_networking }}" = "true" ]; then
             echo "[+] Applying Networking patches for ${KVER_SHORT}..."
             find "$PATCH_DIR/common" -path "*${KVER_SHORT}*" -name "*bbr*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
           fi
 
-          # 5. DroidSpaces-OSS
           if [ "${{ inputs.enable_droidspaces }}" = "true" ]; then
             echo "[+] Applying DroidSpaces-OSS patches..."
             find "$PATCH_DIR" -name "*droidspaces*.patch" -exec sh -c 'patch -p1 --forward --fuzz=3 < "$1" || true' _ {} \;
           fi
 
-          # 6. Performance tuning patches.
-          # Do NOT point this at wild_patches/wild: that tree is archived SUSFS
-          # fix-ups for old 5.x/preview layouts (base.c, fdinfo.c, task_mmu.c),
-          # manual hook patches and KSU-Next bundles. Run with --fuzz over a
-          # current 6.x tree they stack stale code on top of SUSFS - that is what
-          # broke fs/proc/base.c here (BIT_SUS_MAPS / vma) and fs/notify/fdinfo.c
-          # before. Only the real perf patches from common/, each one that does
-          # not apply cleanly is skipped (dry-run first) instead of fuzzing in.
           if [ "${{ inputs.enable_performance }}" = "true" ]; then
             echo "[+] Applying WildKernels performance patches..."
             for name in \
@@ -743,7 +861,6 @@ jobs:
             done
           fi
 
-          # 7. Module Check Bypass (5.10 uses kernel/module.c; 5.15+/6.x uses kernel/module/version.c)
           if [ "${{ inputs.allow_version_mismatch }}" = "true" ]; then
             echo "[+] Applying Module Check Bypass..."
             if [ -f kernel/module/version.c ]; then
@@ -760,13 +877,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # GKI ships cfg80211 as a vendor module and never builds mac80211 into
-          # the image, so the old in-tree mac80211 driver + forced
-          # CONFIG_CFG80211/MAC80211=y both broke the build and would clash with
-          # the phone's own Wi-Fi stack. This driver is cfg80211-only, built
-          # out-of-tree below against the finished kernel and shipped as its own
-          # KSU/Magisk module; the kernel image is left exactly as a normal Wild
-          # build produces it.
           SRC="$GITHUB_WORKSPACE/mosey_src"
           rm -rf "$SRC"; mkdir -p "$SRC"
 
@@ -1191,8 +1301,6 @@ jobs:
           CUSTOM_KERNEL_NAME: ${{ inputs.kernel_name }}
         run: |
           cd kernel_workspace/common
-          # Clean uname insurance: empty .scmversion -> setlocalversion emits
-          # nothing if a build is ever stamped (stamp.bzl strip covers non-stamp).
           : > .scmversion 2>/dev/null || true
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
@@ -1208,12 +1316,8 @@ jobs:
             fi
           }
 
-          # Strip Kleaf's -maybe-dirty scmversion placeholder (its real source).
           sed -i 's/-maybe-dirty//g' ../build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
 
-          # Custom kernel name (replaces the -maybe-dirty scm marker in uname).
-          # Read from an env var so a malicious input can't inject shell.
-          # CONFIG_LOCALVERSION adds the name; AUTO=n drops the git/dirty suffix.
           if [ -n "${CUSTOM_KERNEL_NAME:-}" ]; then
             KN="$(printf '%s' "$CUSTOM_KERNEL_NAME" | tr -cd 'A-Za-z0-9._-')"
             if [ -n "$KN" ]; then
@@ -1223,7 +1327,6 @@ jobs:
             fi
           fi
 
-          # Disable CONFIG_WERROR so unused-variable warnings in patched files never fail the build
           set_kconfig CONFIG_WERROR n
           echo "KBUILD_CFLAGS += -Wno-error -Wno-unused-variable -Wno-unused-function -Wno-unused-label -Wno-unused-but-set-variable" >> Makefile
 
@@ -1269,21 +1372,15 @@ jobs:
             set_kconfig CONFIG_DEBUG_INFO_BTF y
           fi
 
-          # only enable NTSync if its source actually made it into the tree,
-          # else built-in.a references a drivers/misc/ntsync.o with no source
           if [ "${{ inputs.enable_ntsync }}" = "true" ] && [ -f drivers/misc/ntsync.c ]; then
             set_kconfig CONFIG_NTSYNC y
           fi
 
-          # (Mosey no longer forces cfg80211/mac80211/nlmon into the image;
-          #  the wonder phy is a separate out-of-tree module - see below.)
 
-          # Remove check_defconfig and relax KMI symbol trimming in legacy build configs
           sed -i 's/check_defconfig//' build.config.gki* || true
           sed -i 's/TRIM_NONLISTED_KMI=1/TRIM_NONLISTED_KMI=0/g' build.config.gki* || true
           sed -i 's/KMI_SYMBOL_LIST_STRICT_MODE=1/KMI_SYMBOL_LIST_STRICT_MODE=0/g' build.config.gki* || true
 
-          # Empty protected exports files in-place and disable strict KMI trimming (without deleting lines)
           for f in android/abi_gki_protected_exports_*; do
             [ -f "$f" ] && : > "$f"
           done
@@ -1328,7 +1425,6 @@ jobs:
           SRC="$GITHUB_WORKSPACE/mosey_src"
           OBJ="$RUNNER_TEMP/mosey_kobj"; rm -rf "$OBJ"; mkdir -p "$OBJ"
 
-          # finished .config, Image and symvers, in either layout (bazel / build.sh)
           cfg=""
           for c in bazel-bin/common/kernel_aarch64_config/out_dir/.config out/dist/.config out/.config; do
             [ -f "$c" ] && { cfg="$c"; break; }
@@ -1344,11 +1440,9 @@ jobs:
             exit 0
           fi
 
-          # read the release from the Image so vermagic matches byte for byte
           krel="$(strings -n 16 "$img" | sed -n 's/^Linux version \([0-9][^ ]*\) .*/\1/p' | head -n1)"
           [ -n "$krel" ] || krel="${{ steps.sync-kernel.outputs.resolved_kver }}"
 
-          # same prebuilt clang the kernel used (repo-synced under kernel_workspace)
           clang_ver="$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null | head -n1 || true)"
           clang_bin="$(sed -n 's/^CLANG_PREBUILT_BIN=//p' common/build.config.common 2>/dev/null | head -n1 || true)"
           clang_bin="${clang_bin//\$\{CLANG_VERSION\}/$clang_ver}"
@@ -1365,8 +1459,6 @@ jobs:
           export PATH="$PWD/$clang_bin:$PATH"
 
           cp "$cfg" "$OBJ/.config"
-          # 6.12 GKI has CONFIG_RUST=y; a C module never needs it and the runner
-          # has no matching rustc, so switch it off rather than let olddefconfig guess
           [ -f common/scripts/config ] && common/scripts/config --file "$OBJ/.config" --disable RUST || true
 
           mk=(make -C common O="$OBJ" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
@@ -1376,8 +1468,6 @@ jobs:
           echo "$krel" > "$OBJ/include/config/kernel.release"
           printf '#define UTS_RELEASE "%s"\n' "$krel" > "$OBJ/include/generated/utsrelease.h"
 
-          # vmlinux CRCs from the real build; cfg80211 symbols stay unversioned
-          # on purpose (they resolve against the phone's own cfg80211.ko)
           sv="$(find bazel-bin/common/kernel_aarch64 out -maxdepth 3 \( -name vmlinux.symvers -o -name Module.symvers \) -type f 2>/dev/null | head -n1 || true)"
           if [ -n "$sv" ]; then cp "$sv" "$OBJ/Module.symvers"; else echo "::warning::Mosey: no symvers, core symbols unversioned"; fi
 
@@ -1391,11 +1481,6 @@ jobs:
             *) echo "::warning::Mosey: vermagic '$vermagic' does not start with $krel" ;;
           esac
 
-          # ---- package the module around the freshly-built .ko
-          # Preferred: bake the .ko into the full Mosey enabler committed at
-          # mosey/enabler/ (feelliao's userspace stack + our wonder-load.sh), so
-          # one flashable zip carries both halves. Fallback: a minimal module
-          # that only loads the wonder phy, for when the repo has no enabler.
           ENABLER="$GITHUB_WORKSPACE/mosey/enabler"
           PKG="$GITHUB_WORKSPACE/mosey_wonder/pkg"
           rm -rf "$GITHUB_WORKSPACE/mosey_wonder"; mkdir -p "$PKG"
@@ -1404,6 +1489,14 @@ jobs:
             cp -a "$ENABLER/." "$PKG/"
             rm -f "$PKG/NOTICE-wonder.md"
             MODNAME="Mosey-enabler"
+            if [ -f "$ENABLER/blobs.manifest" ]; then
+              MOSEY_SHIM_BASE="${{ vars.MOSEY_SHIM_BASE }}" bash "$GITHUB_WORKSPACE/tools/fetch-blobs.sh" "$ENABLER/blobs.manifest" "$PKG" \
+                || echo "::warning::Mosey enabler: blob fetch reported errors; the shim may be absent from the zip. Set the MOSEY_SHIM_BASE repo variable to where you host the GPLv2 shim APKs."
+              rm -f "$PKG/blobs.manifest"
+            fi
+            for a in system_ext/priv-app/MoseyBridgeShim/MoseyBridgeShim.apk payload/MoseyBridgeShim.apk; do
+              [ -s "$PKG/$a" ] || echo "::warning::Mosey enabler: $a missing from the zip - fetch-blobs couldn't place it (check the MOSEY_SHIM_BASE repo variable and the manifest URLs). customize.sh will flag it on-device."
+            done
           else
             echo "[+] No mosey/enabler in repo; shipping the minimal wonder loader module"
             mkdir -p "$PKG/META-INF/com/google/android"
@@ -1490,8 +1583,6 @@ jobs:
             MODNAME="Mosey-wonder"
           fi
 
-          # drop in the kernel-specific .ko + chosen MAC; wonder-load.sh (shipped
-          # in the enabler) insmods it at boot, no-op if a native wonder phy exists
           cp "$ko" "$PKG/wonder_mosey_wild.ko"
           echo "${{ inputs.mosey_mac_addr }}" > "$PKG/mac_addr"
           for s in post-fs-data.sh wonder-load.sh service.sh post-mount.sh boot-completed.sh                    customize.sh uninstall.sh action.sh mosey-control.sh                    META-INF/com/google/android/update-binary; do
@@ -1580,8 +1671,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p managers
-          # The in-kernel driver is already baked into the boot image; this
-          # just grabs the userspace manager app so it ships in one place.
           case "${{ matrix.root_variant }}" in
             FinaSU)        MGR_REPO="LyraVoid/FinaSU" ;;
             BakaSU)        MGR_REPO="Baka-SU/BakaSU" ;;

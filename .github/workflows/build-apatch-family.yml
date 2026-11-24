@@ -18,9 +18,9 @@ on:
           - all
         default: android15-6.6
       gki_lts_version:
-        description: "LTS sublevel ONLY - the last 2-3 digits (e.g. 144 for 6.6.144). The x.y prefix comes from the Kernel Version Family above. Blank = latest LTS for that family."
+        description: "Sublevel: 'All' builds every released sublevel on the family's KMI generation, 'LTS' just the branch tip, or the last digits of a specific one (e.g. 150)"
         type: string
-        default: "144"
+        default: "All"
       kernel_name:
         description: "Custom kernel name for uname (e.g. Dev_DcS) - replaces the -maybe-dirty marker. Letters/digits/._- only. Blank = stock."
         type: string
@@ -159,63 +159,268 @@ jobs:
         shell: bash
         run: |
           python3 - << 'EOF'
+          import base64
           import json
           import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
 
           req_family = "${{ inputs.kernel_build_version }}"
           req_lts = "${{ inputs.gki_lts_version }}".strip()
-          # box holds only the LTS sublevel (e.g. "144"); tolerate a full
-          # "6.6.144" too by keeping just the last dot-component.
-          req_sub = req_lts.split(".")[-1].strip() if req_lts else ""
+          req_kmi = "auto"
           req_root = "NoRoot"
-
-          all_families = [
-              {
-                  "kernel_version": "android14-6.1",
-                  "kver": "6.1",
-                  "manifest_branch": "common-android14-6.1-lts",
-                  "susfs_branch": "gki-android14-6.1",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android15-6.6",
-                  "kver": "6.6",
-                  "manifest_branch": "common-android15-6.6-lts",
-                  "susfs_branch": "gki-android15-6.6",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-              {
-                  "kernel_version": "android16-6.12",
-                  "kver": "6.12",
-                  "manifest_branch": "common-android16-6.12-lts",
-                  "susfs_branch": "gki-android16-6.12",
-                  "cache_type": "bazel",
-                  "build_tool": "bazel",
-              },
-          ]
-
-          if req_family == "all":
-              selected_families = all_families
-          else:
-              selected_families = [f for f in all_families if f["kernel_version"] == req_family]
-
           if req_root == "All":
               roots = ["KernelSU-Next", "KernelSU", "BakaSU"]
           else:
               roots = [req_root]
 
+          all_families = [
+              {"kernel_version": "android14-6.1",  "kver": "6.1",  "susfs_branch": "gki-android14-6.1",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android15-6.6",  "kver": "6.6",  "susfs_branch": "gki-android15-6.6",  "cache_type": "bazel", "build_tool": "bazel"},
+              {"kernel_version": "android16-6.12", "kver": "6.12", "susfs_branch": "gki-android16-6.12", "cache_type": "bazel", "build_tool": "bazel"},
+          ]
+
+          selected = all_families if req_family == "all" else [f for f in all_families if f["kernel_version"] == req_family]
+
+          if req_kmi != "auto" and not req_kmi.isdigit():
+              print(f"::error::kmi_generation is '{req_kmi}': use 'auto' or the number from `uname -r` (…-android16-6-… is 6)")
+              sys.exit(1)
+
+          GOOGLE = "https://android.googlesource.com"
+
+          def fetch(url):
+              for attempt in (1, 2, 3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as r:
+                          return r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404 or attempt == 3:
+                          raise
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                  time.sleep(2 * attempt)
+
+          def gitiles(repo, ref, path):
+              return base64.b64decode(fetch(f"{GOOGLE}/{repo}/+/refs/heads/{ref}/{path}?format=TEXT")).decode("utf-8", "replace")
+
+          def manifest_branches():
+              return list(json.loads(fetch(f"{GOOGLE}/kernel/manifest/+refs/heads?format=JSON").decode().split("\n", 1)[1]))
+
+          _seen = {}
+          def branch_info(manifest_branch):
+              """Version and KMI generation at the tip of what a manifest syncs, or None."""
+              if manifest_branch not in _seen:
+                  try:
+                      manifest = gitiles("kernel/manifest", manifest_branch, "default.xml")
+                      proj = re.search(r'<project[^>]*path="common"[^>]*>', manifest)
+                      rev = re.search(r'revision="([^"]+)"', proj.group(0)) if proj else None
+                      rev = (rev or re.search(r'<default[^>]*revision="([^"]+)"', manifest)).group(1)
+                      makefile = gitiles("kernel/common", rev, "Makefile")
+                      version = ".".join(re.search(rf"^{k} = (\d+)", makefile, re.M).group(1)
+                                         for k in ("VERSION", "PATCHLEVEL", "SUBLEVEL"))
+                      kmi = None
+                      for f in ("build.config.constants", "build.config.common"):
+                          try:
+                              m = re.search(r"^KMI_GENERATION=(\d+)", gitiles("kernel/common", rev, f), re.M)
+                          except Exception:
+                              m = None
+                          if m:
+                              kmi = int(m.group(1))
+                              break
+                      _seen[manifest_branch] = {"manifest": manifest_branch, "branch": rev, "version": version, "kmi": kmi}
+                  except Exception:
+                      _seen[manifest_branch] = None
+              return _seen[manifest_branch]
+
+          def pick_branch(fam, kmi, asked):
+              """Which of Google's branches to build for this family.
+
+              kmi is 'auto' or a generation number, asked is a full x.y.z or None.
+
+              The phone's drivers are built for one KMI generation and only load on a
+              kernel of that same generation. The -lts branch moves on to the next one
+              before any phone does: 6.12 -lts went to 7 while every release Google has
+              cut, and with it the Pixel 10, is on 6 - and a generation-7 kernel on
+              that phone is a bootloop. So "newest code" and "boots" are not always the
+              same branch: take -lts while it is on the wanted generation, otherwise
+              the newest dated release branch that is.
+              """
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+
+              def releases(gen):
+                  seen_one = False
+                  for b in dated:
+                      i = branch_info(b)
+                      if not i or not i["kmi"]:
+                          if seen_one:
+                              return
+                          continue
+                      seen_one = True
+                      if i["kmi"] < gen:
+                          return
+                      if i["kmi"] == gen:
+                          yield i
+
+              if kmi.isdigit():
+                  want = int(kmi)
+              else:
+                  want = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if want is None and lts:
+                      want = lts["kmi"]
+              if want is None:
+                  print(f"::error::{name}: could not read Google's branches to work out the KMI generation. "
+                        f"Nothing built - run it again.")
+                  sys.exit(1)
+
+              if lts and lts["kmi"] == want:
+                  ref = next(releases(want), None)
+                  return dict(lts, ref=ref["branch"] if ref else "", ref_exact="false")
+
+              src = None
+              if asked:
+                  src = next((i for i in releases(want) if i["version"] == asked), None)
+              src = src or next(releases(want), None)
+              if src:
+                  print(f"[i] {name}: -lts is on KMI generation {lts['kmi'] if lts else '?'}, "
+                        f"building {src['branch']} ({src['version']}) which is on {want}")
+                  return dict(src, ref=src["branch"], ref_exact="true")
+
+              have = sorted({i["kmi"] for i in map(branch_info, dated[:6]) if i and i["kmi"]} | ({lts["kmi"]} if lts else set()))
+              msg = f"{name}: no branch on KMI generation {want} (Google has {', '.join(map(str, have)) or 'none readable'})."
+              if len(selected) == 1 or not kmi.isdigit():
+                  print(f"::error::{msg}")
+                  sys.exit(1)
+              print(f"::warning::{msg} Using 'auto' for this family.")
+              return None
+
+          def requested(fam):
+              if req_lts.isdigit():
+                  return f'{fam["kver"]}.{int(req_lts)}'
+              if re.fullmatch(re.escape(fam["kver"]) + r"\.\d+", req_lts):
+                  return f'{fam["kver"]}.{int(req_lts.rsplit(".", 1)[1])}'
+              return None
+
+          req_all = req_lts.upper() == "ALL"
+
+          def wanted_gen(fam):
+              """The -lts branch info, the family's dated release branches (newest
+              first), and the KMI generation we build for (req_kmi, or the newest
+              Google has)."""
+              name = fam["kernel_version"]
+              lts = branch_info(f"common-{name}-lts")
+              try:
+                  dated = sorted((b for b in manifest_branches()
+                                  if re.fullmatch(rf"common-{re.escape(name)}-\d{{4}}-\d{{2}}", b)), reverse=True)
+              except Exception as e:
+                  print(f"::warning::could not list Google's release branches ({e})")
+                  dated = []
+              if req_kmi.isdigit():
+                  gen = int(req_kmi)
+              else:
+                  gen = next((i["kmi"] for i in map(branch_info, dated) if i and i["kmi"]), None)
+                  if gen is None and lts:
+                      gen = lts["kmi"]
+              return lts, dated, gen
+
+          def list_sources(fam):
+              """Every distinct sublevel to build for 'All': the -lts tip (when it is
+              on the wanted generation) plus each dated release branch on it, newest
+              first, deduped by version. A gen-7 kernel on a gen-6 phone bootloops,
+              so nothing off the wanted generation is ever added."""
+              lts, dated, gen = wanted_gen(fam)
+              on_gen, seen_gen = [], False
+              for b in dated:
+                  i = branch_info(b)
+                  if not i or not i["kmi"]:
+                      if seen_gen:
+                          break
+                      continue
+                  if i["kmi"] < gen:
+                      break
+                  if i["kmi"] == gen:
+                      seen_gen = True
+                      on_gen.append(i)
+              out, seen = [], set()
+              if lts and lts["kmi"] == gen:
+                  out.append(dict(lts, ref=on_gen[0]["branch"] if on_gen else "", ref_exact="false"))
+                  seen.add(lts["version"])
+              for i in on_gen:
+                  if i["version"] in seen:
+                      continue
+                  out.append(dict(i, ref=i["branch"], ref_exact="true"))
+                  seen.add(i["version"])
+              return out, gen
+
+          if not req_all and req_lts and req_lts.upper() != "LTS" and not any(requested(f) for f in selected):
+              print(f"::warning::gki_lts_version '{req_lts}' is not a sublevel of the selected family; building the branch tip instead")
+
           include = []
-          for fam in selected_families:
-              lts_val = "lts"
-              if req_sub.isdigit():
-                  lts_val = fam["kver"] + "." + req_sub
+          for fam in selected:
+              if req_all:
+                  srcs, gen = list_sources(fam)
+                  if not srcs:
+                      print(f"::error::{fam['kernel_version']}: found no branch on KMI generation {gen} to build. Nothing built - run it again.")
+                      sys.exit(1)
+                  built = []
+                  for src in srcs:
+                      entry = dict(fam)
+                      entry["manifest_branch"] = src["manifest"]
+                      entry["gki_branch"] = src["branch"]
+                      entry["kmi_generation"] = str(src["kmi"] or "")
+                      entry["kmi_ref_branch"] = src["ref"]
+                      entry["kmi_ref_exact"] = src["ref_exact"]
+                      entry["lts_version"] = src["version"] or f'{fam["kver"]}-LTS'
+                      entry["follow_tip"] = "true" if src["ref_exact"] == "false" else "false"
+                      for r in roots:
+                          e = dict(entry)
+                          e["root_variant"] = r
+                          include.append(e)
+                      built.append(src["version"] or "tip")
+                  print(f"[i] {fam['kernel_version']}: building all {len(srcs)} sublevel(s) on KMI {gen}: {', '.join(built)}")
+                  continue
+              entry = dict(fam)
+              want = requested(fam)
+              src = pick_branch(fam, req_kmi, want) or pick_branch(fam, "auto", want)
+              entry["manifest_branch"] = src["manifest"]
+              entry["gki_branch"] = src["branch"]
+              entry["kmi_generation"] = str(src["kmi"] or "")
+              entry["kmi_ref_branch"] = src["ref"]
+              entry["kmi_ref_exact"] = src["ref_exact"]
+              tip = src["version"]
+              if want == tip:
+                  want = None
+              if want and tip and int(want.rsplit(".", 1)[1]) > int(tip.rsplit(".", 1)[1]):
+                  msg = f"{want} does not exist on {src['branch']}, which is at {tip}."
+                  if len(selected) == 1:
+                      print(f"::error::{msg} Use 'LTS' or a sublevel up to {tip.rsplit('.', 1)[1]}.")
+                      sys.exit(1)
+                  print(f"::warning::{msg} Building {tip} for this family.")
+                  want = None
+              if want:
+                  entry["lts_version"] = want
+                  entry["follow_tip"] = "false"
+              else:
+                  entry["lts_version"] = tip or f'{fam["kver"]}-LTS'
+                  entry["follow_tip"] = "true"
               for r in roots:
-                  entry = dict(fam)
-                  entry["lts_version"] = lts_val
-                  entry["root_variant"] = r
-                  include.append(entry)
+                  e = dict(entry)
+                  e["root_variant"] = r
+                  include.append(e)
+
+          if len(include) > 256:
+              print(f"::error::this selection makes {len(include)} jobs and GitHub caps a matrix at 256. Narrow it: one family, 'LTS' or a single sublevel, or fewer root variants.")
+              sys.exit(1)
 
           matrix_json = json.dumps({"include": include})
           print("Generated matrix:", matrix_json)

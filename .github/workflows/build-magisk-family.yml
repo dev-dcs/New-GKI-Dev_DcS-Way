@@ -1,15 +1,5 @@
 name: Build Magisk Family for Pixel 8-11 (init_boot.img patch)
 
-# Magisk-family pipeline (@Dev_DcS). Unlike the KernelSU / APatch families this
-# one doesn't compile a kernel - Magisk is systemless and lives in the ramdisk,
-# which on Pixel 8-11 sits in init_boot.img (NOT boot.img). So the job here is:
-# grab the stock init_boot, patch it headless with the chosen fork's magiskboot
-# + boot_patch.sh, and hand back a flashable init_boot. Build the matching stock
-# kernel with one of the other workflows if you want both.
-#
-# Boot source order: a vendored image under Construction_Site/Orange_Cone/<gen>/
-# wins; otherwise point boot_image_url at a factory or OTA zip and it's pulled +
-# unpacked on the runner.
 
 permissions:
   contents: write
@@ -96,7 +86,6 @@ jobs:
           GEN="${{ inputs.android_gen }}"
           OUT="$GITHUB_WORKSPACE/boot_src"; mkdir -p "$OUT"
 
-          # 1) Vendored image wins. Check a couple of sensible locations.
           VENDORED=""
           for p in \
             "Construction_Site/Orange_Cone/$GEN/init_boot.img" \
@@ -125,8 +114,15 @@ jobs:
             fi
             [ -f init_boot.img ] || { echo "::error::could not extract init_boot.img from the supplied zip"; exit 1; }
           else
-            echo "::error::No init_boot.img found. Vendor one under Construction_Site/Orange_Cone/$GEN/ or set boot_image_url."
-            exit 1
+            FETCH="Construction_Site/Orange_Cone/fetch_init_boot.sh"
+            if [ -f "$FETCH" ]; then
+              echo "[+] No vendored image or URL; auto-fetching stock init_boot from Google"
+              bash "$FETCH" "${{ inputs.device_codename }}" "$GEN" "$OUT"
+              [ -f "$OUT/init_boot.img" ] || { echo "::error::auto-fetch produced no init_boot.img - vendor one under Construction_Site/Orange_Cone/$GEN/ or set boot_image_url"; exit 1; }
+            else
+              echo "::error::No init_boot.img found. Vendor one under Construction_Site/Orange_Cone/$GEN/, set boot_image_url, or add Construction_Site/Orange_Cone/fetch_init_boot.sh."
+              exit 1
+            fi
           fi
 
           echo "[+] init_boot.img: $(file -b "$OUT/init_boot.img" 2>/dev/null || echo unknown), $(stat -c%s "$OUT/init_boot.img") bytes"
@@ -141,9 +137,6 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/magisk_apk_dl"
           cd "$GITHUB_WORKSPACE/magisk_apk_dl"
 
-          # Each fork publishes its manager APK (which carries magiskboot +
-          # boot_patch.sh) on GitHub releases. Pattern-match loosely; fall back
-          # to the newest .apk asset.
           case "${{ inputs.magisk_fork }}" in
             Magisk)       REPO="topjohnwu/Magisk" ;;
             Magisk-Alpha) REPO="vvb2060/magisk_files" ;;
@@ -170,13 +163,10 @@ jobs:
           unzip -oq "${{ steps.fetch-magisk.outputs.apk_path }}" -d "$WORK/apk"
           cd "$WORK"
 
-          # Host magiskboot (the runner is x86_64). Fall back to x86 if needed.
           BOOT_SO="$(ls apk/lib/x86_64/libmagiskboot.so apk/lib/x86/libmagiskboot.so 2>/dev/null | head -n1 || true)"
           [ -n "$BOOT_SO" ] || { echo "::error::libmagiskboot.so not in the APK (layout changed?) - this fork needs hand-patching"; exit 1; }
           cp "$BOOT_SO" ./magiskboot && chmod +x magiskboot
 
-          # arm64 payload binaries + assets that boot_patch.sh bakes into the
-          # ramdisk. Names drift across versions, so copy whatever's present.
           A64="apk/lib/arm64-v8a"
           cp "$A64/libmagiskinit.so"  ./magiskinit  2>/dev/null || true
           cp "$A64/libmagisk64.so"    ./magisk64    2>/dev/null || cp "$A64/libmagisk.so" ./magisk64 2>/dev/null || true

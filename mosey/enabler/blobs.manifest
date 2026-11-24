@@ -1,0 +1,2 @@
+2122aff5c78a1490f14fe2c8a4c7bcc9145dad76194b8f27f818b3c62fadb8ff  system_ext/priv-app/MoseyBridgeShim/MoseyBridgeShim.apk  ${MOSEY_SHIM_BASE}/MoseyBridgeShim-privapp.apk
+c254abf23de5a78ec7cf49cff59da86f2656bfc1514004d04e2e54bf396474d4  payload/MoseyBridgeShim.apk  ${MOSEY_SHIM_BASE}/MoseyBridgeShim-payload.apk
