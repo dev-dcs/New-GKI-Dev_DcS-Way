@@ -121,6 +121,10 @@ on:
         description: "Container CPU + process limits (--cpus/--pids-limit; CFS_BANDWIDTH + CGROUP_PIDS - shifts GKI ABI, the KMI check gates it, boot-test)"
         type: boolean
         default: false
+      enable_bootstate_spoof:
+        description: "Boot-state concealment: rewrite verifiedboot/lock tokens in /proc/cmdline + ro.boot.* to locked (presentation only, KMI-safe, default off - boot-test; hardware attestation still needs a keybox)"
+        type: boolean
+        default: false
       enable_performance:
         description: "Enable WildKernels Performance Tuning & Compression Patches (LZ4/ZSTD)"
         type: boolean
@@ -929,6 +933,46 @@ jobs:
             else
               echo "::error::TracerPid fix requested but patch not found"
               exit 1
+            fi
+          fi
+
+          if true; then
+            echo "[+] Applying /proc/net/unix manager-socket hider (proc-hide)..."
+            PNU="$GITHUB_WORKSPACE/kernel-patches/proc-hide/0001-proc-net-unix-hide-manager-socket.patch"
+            if [ -f "$PNU" ]; then
+              if patch -p1 -N -s --fuzz=3 --dry-run -i "$PNU" >/dev/null 2>&1; then
+                patch -p1 -N -s --fuzz=3 --no-backup-if-mismatch -i "$PNU"
+                echo "[+] proc-hide applied (inert until net.hide_manager_socket=1)"
+              else
+                echo "::error::proc-hide patch did not apply cleanly"
+                exit 1
+              fi
+            else
+              echo "::error::proc-hide requested but patch not found"
+              exit 1
+            fi
+          fi
+
+          if true; then
+            echo "[+] Integrating boot-state concealment (devdcs_bootstate)..."
+            BSD="$GITHUB_WORKSPACE/kernel-patches/bootstate-spoof"
+            if [ -f "$BSD/devdcs_bootstate.c" ]; then
+              cp -f "$BSD/devdcs_bootstate.c" init/devdcs_bootstate.c
+              cp -f "$BSD/Kconfig" Kconfig.devdcs_bootstate
+              grep -q 'Kconfig.devdcs_bootstate' Kconfig || \
+                echo 'source "Kconfig.devdcs_bootstate"' >> Kconfig
+              grep -q 'devdcs_bootstate\.o' init/Makefile || \
+                printf 'obj-$(CONFIG_DEVDCS_BOOTSTATE_SPOOF) += devdcs_bootstate.o\n' >> init/Makefile
+              echo "[+] devdcs_bootstate wired (source + Kconfig + Makefile)"
+              if [ "${{ inputs.enable_bootstate_spoof }}" = "true" ]; then
+                DEF="arch/arm64/configs/gki_defconfig"
+                grep -q '^CONFIG_DEVDCS_BOOTSTATE_SPOOF=y' "$DEF" || echo 'CONFIG_DEVDCS_BOOTSTATE_SPOOF=y' >> "$DEF"
+                echo "[!] boot-state spoof ON - presentation only; boot-test, and pair with a keybox for hardware attestation"
+              else
+                echo "[i] boot-state spoof built but OFF (set enable_bootstate_spoof=true to enable)"
+              fi
+            else
+              echo "::warning::bootstate-spoof sources not found; skipping"
             fi
           fi
 

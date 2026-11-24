@@ -1,0 +1,140 @@
+net/unix: add net.hide_manager_socket to drop root-manager sockets from /proc/net/unix
+
+A rooted device's su manager talks to its daemon over an abstract AF_UNIX
+socket. The name shows up in /proc/net/unix (the '@name' entries), and a
+detection app that can't see the root files still enumerates that list and
+flags the known manager name. SUSFS hides mounts, paths, kstat and the kallsyms
+symbols but leaves this socket list untouched.
+
+With net.hide_manager_socket = 1 and one or more names in
+net.hidden_socket_name (comma-separated, matched against the abstract name
+without the leading '@'), those entries are skipped in the seq walk, so the
+socket is simply absent from the list. Both default off / empty, so stock
+behaviour is unchanged until you name a socket. Finding the name is a one-liner
+on-device: cat /proc/net/unix | grep '@'.
+
+Everything is file-scope static plus a late_initcall register_sysctl(); the
+hook is one early return in unix_seq_show(). No exported symbol, no struct a
+vendor module can see - the GKI KMI is untouched.
+
+Signed-off-by: @Dev_DcS
+---
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index 1c2b3d4..2d3e4f5 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -115,6 +115,8 @@
+ #include <linux/freezer.h>
+ #include <linux/file.h>
+ #include <linux/btf_ids.h>
++#include <linux/capability.h>
++#include <linux/sysctl.h>
+
+ #include "scm.h"
+
+@@ -3360,6 +3362,78 @@ static const struct seq_operations unix_seq_ops = {
+ 	.show   = unix_seq_show,
+ };
+
++#ifdef CONFIG_PROC_FS
++static int hide_manager_socket __read_mostly;
++static char hidden_socket_name[128];
++
++/*
++ * Root-manager concealment. The su manager keeps an abstract AF_UNIX socket
++ * whose name leaks in /proc/net/unix even when every file-level trace is
++ * hidden. net.hide_manager_socket = 1 plus the abstract name(s) in
++ * net.hidden_socket_name (comma-separated, no leading '@') drops the matching
++ * entries from the list. Both default off/empty - stock until you set a name.
++ * Writing needs CAP_SYS_ADMIN.  -- @Dev_DcS
++ */
++static bool devdcs_unix_hidden(const struct unix_sock *u)
++{
++	const struct unix_address *addr;
++	const char *name, *p, *end;
++	int nlen;
++
++	if (!READ_ONCE(hide_manager_socket))
++		return false;
++
++	addr = u->addr;
++	if (!addr)
++		return false;
++
++	nlen = addr->len - offsetof(struct sockaddr_un, sun_path);
++	if (nlen <= 1 || addr->name->sun_path[0] != '\0')
++		return false;		/* only abstract sockets carry a leak */
++
++	name = addr->name->sun_path + 1;
++	nlen -= 1;
++
++	for (p = hidden_socket_name; *p; p = (*end == ',') ? end + 1 : end) {
++		size_t mlen;
++
++		end = strchrnul(p, ',');
++		mlen = end - p;
++		if (mlen && mlen == (size_t)nlen && !memcmp(p, name, mlen))
++			return true;
++	}
++	return false;
++}
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++static int devdcs_sock_hide_write(const struct ctl_table *table, int write,
++#else
++static int devdcs_sock_hide_write(struct ctl_table *table, int write,
++#endif
++		void *buffer, size_t *lenp, loff_t *ppos)
++{
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	if (table->data == &hide_manager_socket)
++		return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++	return proc_dostring(table, write, buffer, lenp, ppos);
++}
++
++static struct ctl_table devdcs_sock_sysctls[] = {
++	{
++		.procname	= "hide_manager_socket",
++		.data		= &hide_manager_socket,
++		.maxlen		= sizeof(hide_manager_socket),
++		.mode		= 0644,
++		.proc_handler	= devdcs_sock_hide_write,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{
++		.procname	= "hidden_socket_name",
++		.data		= hidden_socket_name,
++		.maxlen		= sizeof(hidden_socket_name),
++		.mode		= 0644,
++		.proc_handler	= devdcs_sock_hide_write,
++	},
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++	{ }
++#endif
++};
++
++static int __init devdcs_sock_sysctl_init(void)
++{
++	register_sysctl("net", devdcs_sock_sysctls);
++	return 0;
++}
++late_initcall(devdcs_sock_sysctl_init);
++#else
++static inline bool devdcs_unix_hidden(const struct unix_sock *u) { return false; }
++#endif /* CONFIG_PROC_FS */
++
+ static int unix_seq_show(struct seq_file *seq, void *v)
+ {
+ 	if (v == SEQ_START_TOKEN)
+@@ -3369,6 +3443,9 @@ static int unix_seq_show(struct seq_file *seq, void *v)
+ 		struct sock *s = v;
+ 		struct unix_sock *u = unix_sk(s);
+
++		if (devdcs_unix_hidden(u))
++			return 0;
++
+ 		unix_state_lock(s);
+
+ 		seq_printf(seq, "%pK: %08X %08X %08X %04X %02X %5lu",

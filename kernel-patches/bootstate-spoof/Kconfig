@@ -1,0 +1,18 @@
+config DEVDCS_BOOTSTATE_SPOOF
+	bool "Spoof bootloader lock state in /proc/cmdline and ro.boot.*"
+	default n
+	help
+	  Rewrite the verified-boot / lock tokens the bootloader leaves in the
+	  kernel command line (verifiedbootstate, vbmeta.device_state,
+	  flash.locked, warranty_bit, verifiedbooterror, selinux) to their stock
+	  locked values in an early initcall, before init reads them. A software
+	  check of /proc/cmdline or the ro.boot.* properties then sees a locked
+	  phone.
+
+	  Presentation only: it does not relock anything and does not touch
+	  hardware key attestation (Titan M), which still reports the real state -
+	  pair it with a valid keybox for that. Lock signals delivered through
+	  bootconfig rather than the command line are handled by the companion
+	  resetprop step, not here.
+
+	  Compiled out entirely unless set. If unsure, say N.
